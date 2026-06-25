@@ -218,7 +218,7 @@ R1 Pro 使用官方 Galaxea USD，底盘通过自带关节控制：
 | `T/G` | 手腕 Roll 正/负方向，对应 `arm_joint7` |
 | `F/H` | 手腕 Pitch 正/负方向，对应 `arm_joint6` |
 | `R/Y` | 手腕 Yaw 正/负方向，对应 `arm_joint5` |
-| `3/4` | 第 7 轴正/负方向 |
+| `7/8` | 第 7 轴正/负方向 |
 | `M/N` | 夹爪开/合 |
 
 R1 Pro 夹爪的两个 finger joint 限位方向相反：
