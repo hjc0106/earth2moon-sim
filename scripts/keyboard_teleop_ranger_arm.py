@@ -5,6 +5,8 @@
 """
 
 import argparse
+import csv
+import math
 import os
 import sys
 import time
@@ -27,7 +29,7 @@ def _ensure_tiangong_on_path() -> None:
 
 _ensure_tiangong_on_path()
 
-from tiangong.utils.assets import TIANGONG_SPACE_STATION_ASSET_PATH, tkmodel_usd_path
+from tiangong.utils.assets import CF2X_ASSET_PATH, TIANGONG_SPACE_STATION_ASSET_PATH, tkmodel_usd_path
 
 
 def default_r1pro_usd_path() -> str:
@@ -38,6 +40,20 @@ def default_r1pro_usd_path() -> str:
         if candidate.exists():
             return str(candidate)
     return str(candidates[0])
+
+
+def default_cf2x_usd_path() -> str:
+    """返回 Crazyflie 默认 USD 路径。"""
+    return str(Path(CF2X_ASSET_PATH).expanduser())
+
+
+def default_drone_trajectory_paths() -> tuple[str, str]:
+    """返回两架 Crazyflie 默认轨迹 CSV 路径。"""
+    repo_root = Path(__file__).resolve().parents[1]
+    return (
+        str((repo_root / "assets" / "trajectories" / "quadrotor_demo_1.csv").resolve()),
+        str((repo_root / "assets" / "trajectories" / "quadrotor_demo_2.csv").resolve()),
+    )
 
 
 @dataclass
@@ -603,6 +619,37 @@ def main() -> None:
         default=4.0,
         help="Uniform scale applied to /World/cf2x and /World/cf2x_01 when grounding them.",
     )
+    default_drone_traj_1, default_drone_traj_2 = default_drone_trajectory_paths()
+    parser.add_argument(
+        "--enable-drone-trajectories",
+        action="store_true",
+        default=True,
+        help="Drive /World/cf2x and /World/cf2x_01 along their CSV trajectories.",
+    )
+    parser.add_argument(
+        "--no-enable-drone-trajectories",
+        action="store_false",
+        dest="enable_drone_trajectories",
+        help="Load the Crazyflie assets without animating them from CSV trajectories.",
+    )
+    parser.add_argument(
+        "--cf2x-trajectory-1",
+        type=str,
+        default=default_drone_traj_1,
+        help="CSV trajectory for /World/cf2x.",
+    )
+    parser.add_argument(
+        "--cf2x-trajectory-2",
+        type=str,
+        default=default_drone_traj_2,
+        help="CSV trajectory for /World/cf2x_01.",
+    )
+    parser.add_argument(
+        "--drone-trajectory-loop",
+        action="store_true",
+        default=True,
+        help="Loop Crazyflie trajectory playback.",
+    )
     parser.add_argument(
         "--ground-z",
         type=float,
@@ -809,14 +856,10 @@ def main() -> None:
     from tiangong.teleop import (
         BaseMotionCommand,
         DroneAssetController,
-        EndEffectorTargetReacher,
         ManipulatorMotionCommand,
         R1ProTeleopController,
         RangerArmTeleopController,
-        TargetMarkerManager,
-        TargetReachCoordinator,
         TeleopDispatcher,
-        parse_target_points,
     )
 
     import carb  # noqa: WPS433
@@ -834,6 +877,8 @@ def main() -> None:
 
     if getattr(args, "deprecated_move_prim", False):
         carb.log_warn("--move-prim is deprecated and ignored; base motion now requires wheel/steer DOFs.")
+    if args.enable_target_reach:
+        carb.log_warn("Target reach markers and auto-follow are disabled in this startup flow; ignoring --enable-target-reach.")
 
     ui_state = {"forward": 0.0, "strafe": 0.0, "lift": 0.0, "yaw": 0.0}
     ui_models = {"forward": None, "strafe": None, "lift": None, "yaw": None}
@@ -884,7 +929,7 @@ def main() -> None:
     settings.set("/app/window/quitOnClose", False)
     settings.set("/app/lifecycle/quitWhenIdle", False)
     if isaac_asset_root_display:
-        carb.log_warn(f"Using local Isaac Sim asset root: {isaac_asset_root_display}")
+        carb.log_info(f"Using local Isaac Sim asset root: {isaac_asset_root_display}")
     if isaac_asset_root_uri:
         settings.set("/persistent/isaac/asset_root/default", isaac_asset_root_uri)
         settings.set("/persistent/isaac/asset_root/cloud", isaac_asset_root_uri)
@@ -919,7 +964,7 @@ def main() -> None:
         UsdPhysics,
         ground_z=args.ground_z,
     )
-    carb.log_warn(f"Using teleop ground Z={args.ground_z:.4f} for grounded assets.")
+    carb.log_info(f"Using teleop ground Z={args.ground_z:.4f} for grounded assets.")
 
     def _clear_stage_selection() -> None:
         if not args.clear_ui_selection:
@@ -1106,8 +1151,140 @@ def main() -> None:
         _disable_asset_physics(asset_prim)
         carb.log_warn(f"{prim_path} set to display-only; PhysX articulation/rigid bodies disabled.")
 
+    def _ensure_drone_prims() -> list[tuple[str, float]]:
+        drone_specs = [
+            ("/World/cf2x", -2.0),
+            ("/World/cf2x_01", 2.0),
+        ]
+        cf2x_path = Path(default_cf2x_usd_path()).expanduser()
+        can_inject_missing = cf2x_path.exists()
+        if not can_inject_missing:
+            carb.log_warn(f"Crazyflie USD not found for missing-drone injection: {cf2x_path}")
+        for drone_path, _offset_y in drone_specs:
+            if stage.GetPrimAtPath(drone_path).IsValid():
+                carb.log_info(f"Using existing drone prim: {drone_path}")
+                continue
+            if not can_inject_missing:
+                carb.log_warn(f"Missing drone prim and no cf2x.usd available to inject it: {drone_path}")
+                continue
+            drone_prim = UsdGeom.Xform.Define(stage, drone_path).GetPrim()
+            drone_prim.GetReferences().AddReference(str(cf2x_path))
+            carb.log_info(f"Injected missing drone prim: {drone_path} <- {cf2x_path}")
+        sim_app.update()
+        return drone_specs
+
+    def _load_drone_trajectory_csv(csv_path: str) -> list[tuple[float, float, float, float, float]]:
+        path = Path(csv_path).expanduser()
+        if not path.exists():
+            carb.log_warn(f"Drone trajectory CSV not found: {path}")
+            return []
+        samples: list[tuple[float, float, float, float, float]] = []
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                try:
+                    samples.append(
+                        (
+                            float(row["time"]),
+                            float(row["x"]),
+                            float(row["y"]),
+                            float(row["z"]),
+                            float(row["yaw_deg"]),
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    carb.log_warn(f"Skipping malformed drone trajectory row in {path}: {exc}")
+        samples.sort(key=lambda sample: sample[0])
+        return samples
+
+    def _sample_drone_trajectory(
+        samples: list[tuple[float, float, float, float, float]],
+        elapsed_seconds: float,
+        loop_enabled: bool,
+    ) -> tuple[Gf.Vec3d, Gf.Vec3f] | None:
+        if not samples:
+            return None
+        if len(samples) == 1:
+            _time, x, y, z, yaw_deg = samples[0]
+            return Gf.Vec3d(x, y, z), Gf.Vec3f(0.0, 0.0, yaw_deg)
+        total_duration = max(samples[-1][0] - samples[0][0], 1e-6)
+        sample_time = elapsed_seconds
+        if loop_enabled:
+            sample_time = samples[0][0] + ((elapsed_seconds - samples[0][0]) % total_duration)
+        elif elapsed_seconds >= samples[-1][0]:
+            _time, x, y, z, yaw_deg = samples[-1]
+            return Gf.Vec3d(x, y, z), Gf.Vec3f(0.0, 0.0, yaw_deg)
+        for left, right in zip(samples, samples[1:]):
+            left_t, left_x, left_y, left_z, left_yaw = left
+            right_t, right_x, right_y, right_z, right_yaw = right
+            if left_t <= sample_time <= right_t:
+                alpha = 0.0 if right_t <= left_t else (sample_time - left_t) / (right_t - left_t)
+                x = left_x + (right_x - left_x) * alpha
+                y = left_y + (right_y - left_y) * alpha
+                z = left_z + (right_z - left_z) * alpha
+                yaw_deg = left_yaw + (right_yaw - left_yaw) * alpha
+                return Gf.Vec3d(x, y, z), Gf.Vec3f(0.0, 0.0, yaw_deg)
+        _time, x, y, z, yaw_deg = samples[-1]
+        return Gf.Vec3d(x, y, z), Gf.Vec3f(0.0, 0.0, yaw_deg)
+
+    def _yaw_degrees_from_quat_wxyz(quat_wxyz) -> float:
+        quat = _quat_wxyz_to_gf(quat_wxyz)
+        rotation = Gf.Rotation(quat)
+        matrix = Gf.Matrix3d(rotation.GetMatrix())
+        forward = matrix.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
+        return math.degrees(math.atan2(float(forward[1]), float(forward[0])))
+
+    def _ensure_drone_rotor_visuals(drone_prim) -> list[dict]:
+        rotor_keywords = ("rotor", "prop", "motor")
+        rotor_entries = []
+        used_paths = set()
+        for prim in Usd.PrimRange(drone_prim):
+            if not prim.IsValid():
+                continue
+            prim_name = prim.GetName().lower()
+            if not any(keyword in prim_name for keyword in rotor_keywords):
+                continue
+            if not prim.IsA(UsdGeom.Xformable):
+                continue
+            prim_path = str(prim.GetPath())
+            if prim_path in used_paths:
+                continue
+            xformable = UsdGeom.Xformable(prim)
+            rotate_op = None
+            for op in xformable.GetOrderedXformOps():
+                if op.GetOpName() == "xformOp:rotateZ:teleop_rotor_spin":
+                    rotate_op = op
+                    break
+            if rotate_op is None:
+                rotate_op = xformable.AddRotateZOp(
+                    precision=UsdGeom.XformOp.PrecisionFloat,
+                    opSuffix="teleop_rotor_spin",
+                )
+            used_paths.add(prim_path)
+            rotor_entries.append({"path": prim_path, "rotate_op": rotate_op})
+        rotor_entries.sort(key=lambda entry: entry["path"])
+        for index, entry in enumerate(rotor_entries):
+            entry["direction"] = 1.0 if index % 2 == 0 else -1.0
+            entry["angle_deg"] = 0.0
+        return rotor_entries[:4]
+
+    def _apply_drone_manual_pose(state: dict) -> None:
+        state["transform_op"].Set(
+            _make_transform_matrix(
+                state["translation"],
+                Gf.Vec3f(
+                    float(state.get("pitch_deg", 0.0)),
+                    float(state.get("roll_deg", 0.0)),
+                    float(state["yaw_deg"]),
+                ),
+            )
+        )
+        state["scale_op"].Set(Gf.Vec3f(args.drone_scale, args.drone_scale, args.drone_scale))
+        for rotor_state in state.get("rotors", []):
+            rotor_state["rotate_op"].Set(float(rotor_state["angle_deg"]))
+
     if args.ground_drones:
-        for drone_path, offset_y in (("/World/cf2x", -2.0), ("/World/cf2x_01", 2.0)):
+        for drone_path, offset_y in _ensure_drone_prims():
             if not stage.GetPrimAtPath(drone_path).IsValid():
                 continue
             asset_controller.lock_asset_to_ground(
@@ -1116,6 +1293,107 @@ def main() -> None:
                 Gf.Vec3f(0.0, 0.0, 80.1330337524414),
                 scale=args.drone_scale,
             )
+
+    drone_trajectory_states = []
+    if args.enable_drone_trajectories:
+        for drone_path, csv_path in (
+            ("/World/cf2x", args.cf2x_trajectory_1),
+            ("/World/cf2x_01", args.cf2x_trajectory_2),
+        ):
+            drone_prim = stage.GetPrimAtPath(drone_path)
+            if not drone_prim.IsValid():
+                carb.log_warn(f"Cannot enable trajectory for missing drone prim: {drone_path}")
+                continue
+            samples = _load_drone_trajectory_csv(csv_path)
+            if not samples:
+                continue
+            _disable_asset_physics(drone_prim)
+            transform_op, scale_op = _reset_to_single_transform_op(drone_prim)
+            initial_pose = _sample_drone_trajectory(samples, samples[0][0], args.drone_trajectory_loop)
+            if initial_pose is None:
+                continue
+            translation, rotation = initial_pose
+            transform_op.Set(_make_transform_matrix(translation, rotation))
+            scale_op.Set(Gf.Vec3f(args.drone_scale, args.drone_scale, args.drone_scale))
+            drone_trajectory_states.append(
+                {
+                    "name": drone_path.rsplit("/", 1)[-1],
+                    "path": drone_path,
+                    "samples": samples,
+                    "transform_op": transform_op,
+                    "scale_op": scale_op,
+                    "translation": translation,
+                    "yaw_deg": float(rotation[2]),
+                    "pitch_deg": 0.0,
+                    "roll_deg": 0.0,
+                    "manual_override": False,
+                    "rotors": _ensure_drone_rotor_visuals(drone_prim),
+                }
+            )
+            carb.log_info(f"Drone trajectory ready: {drone_path} <- {csv_path}")
+    drone_trajectory_start_time = time.time()
+
+    drone_states_by_path = {state["path"]: state for state in drone_trajectory_states}
+    for drone_path in ("/World/cf2x", "/World/cf2x_01"):
+        if drone_path in drone_states_by_path:
+            continue
+        drone_prim = stage.GetPrimAtPath(drone_path)
+        if not drone_prim.IsValid():
+            continue
+        _disable_asset_physics(drone_prim)
+        transform_op, scale_op = _reset_to_single_transform_op(drone_prim)
+        try:
+            translation_np, rotation_quat = _get_world_pose_safe_for_path(drone_path)
+            translation = Gf.Vec3d(*np.asarray(translation_np, dtype=np.float64).reshape(-1)[:3])
+            yaw_deg = _yaw_degrees_from_quat_wxyz(rotation_quat)
+        except Exception:
+            translation = Gf.Vec3d(0.0, 0.0, args.ground_z + 1.0)
+            yaw_deg = 0.0
+        state = {
+            "name": drone_path.rsplit("/", 1)[-1],
+            "path": drone_path,
+            "samples": [],
+            "transform_op": transform_op,
+            "scale_op": scale_op,
+            "translation": translation,
+            "yaw_deg": yaw_deg,
+            "pitch_deg": 0.0,
+            "roll_deg": 0.0,
+            "manual_override": True,
+            "rotors": _ensure_drone_rotor_visuals(drone_prim),
+        }
+        _apply_drone_manual_pose(state)
+        drone_states_by_path[drone_path] = state
+
+    def _apply_drone_trajectories() -> None:
+        if not drone_states_by_path:
+            return
+        elapsed_seconds = time.time() - drone_trajectory_start_time
+        for state in drone_states_by_path.values():
+            if state.get("manual_override", False) or not state.get("samples"):
+                rotor_speed_deg = float(state.get("rotor_speed_deg_per_sec", 540.0))
+                for rotor_state in state.get("rotors", []):
+                    rotor_state["angle_deg"] = (
+                        float(rotor_state.get("angle_deg", 0.0))
+                        + rotor_speed_deg * float(rotor_state["direction"]) * args.dt
+                    ) % 360.0
+                _apply_drone_manual_pose(state)
+                continue
+            pose = _sample_drone_trajectory(state["samples"], elapsed_seconds, args.drone_trajectory_loop)
+            if pose is None:
+                continue
+            translation, rotation = pose
+            state["translation"] = translation
+            state["yaw_deg"] = float(rotation[2])
+            state["pitch_deg"] = 0.0
+            state["roll_deg"] = 0.0
+            state["rotor_speed_deg_per_sec"] = 720.0
+            for rotor_state in state.get("rotors", []):
+                rotor_state["angle_deg"] = (
+                    float(rotor_state.get("angle_deg", 0.0))
+                    + float(state["rotor_speed_deg_per_sec"]) * float(rotor_state["direction"]) * args.dt
+                ) % 360.0
+            _apply_drone_manual_pose(state)
 
     if args.r1pro_display_only and args.r1pro_prim != "/World/r1pro":
         asset_controller.make_display_only("/World/r1pro")
@@ -1138,6 +1416,8 @@ def main() -> None:
     r1pro_articulation_prim_path = _resolve_r1pro_articulation_prim_path(r1pro_scene_prim_path)
     robot_camera_aliases = {"r1pro": {}, "ranger_arm": {}}
     robot_camera_rigs = {}
+    active_camera_control = {"robot_name": None, "alias": None}
+    active_control_context = {"kind": "robot", "path": None}
 
     def _get_world_pose_safe_for_path(prim_path: str):
         try:
@@ -1237,12 +1517,6 @@ def main() -> None:
         camera.GetFocalLengthAttr().Set(focal_length)
         camera.GetHorizontalApertureAttr().Set(20.955)
         camera.GetVerticalApertureAttr().Set(15.2908)
-        marker = UsdGeom.Cube.Define(stage, f"{camera_xform_path}/Marker")
-        marker.GetSizeAttr().Set(0.05)
-        marker_xformable = UsdGeom.Xformable(marker.GetPrim())
-        marker_xformable.ClearXformOpOrder()
-        marker_xformable.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
-        marker_xformable.AddScaleOp().Set(Gf.Vec3f(1.0, 0.6, 0.4))
         local_rotation = Gf.Rotation(Gf.Vec3d(1.0, 0.0, 0.0), rotate_xyz[0])
         local_rotation *= Gf.Rotation(Gf.Vec3d(0.0, 1.0, 0.0), rotate_xyz[1])
         local_rotation *= Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), rotate_xyz[2])
@@ -1250,7 +1524,7 @@ def main() -> None:
             "camera_path": camera_prim_path,
             "body_path": link_path,
             "local_offset": Gf.Vec3d(*translate),
-            "local_rotation": Gf.Quatf(
+            "base_local_rotation": Gf.Quatf(
                 float(local_rotation.GetQuat().GetReal()),
                 Gf.Vec3f(
                     float(local_rotation.GetQuat().GetImaginary()[0]),
@@ -1258,31 +1532,30 @@ def main() -> None:
                     float(local_rotation.GetQuat().GetImaginary()[2]),
                 ),
             ),
+            "adjust_yaw_deg": 0.0,
+            "adjust_pitch_deg": 0.0,
             "translate_op": translate_op,
             "rotate_op": rotate_op,
         }
         return camera_prim_path
 
     def _build_r1pro_camera_aliases(scene_prim_path: str) -> dict[str, str]:
-        usd_aliases = _build_r1pro_usd_camera_aliases(scene_prim_path)
-        if usd_aliases:
-            return usd_aliases
         link_candidates = {
             "head_top": [
-                ("/Root/r1_pro_with_gripper/zed_link", (0.0, 0.0, 0.08), (18.0, 180.0, 0.0), 18.0),
-                ("/r1_pro_with_gripper/zed_link", (0.0, 0.0, 0.08), (18.0, 180.0, 0.0), 18.0),
+                ("/Root/r1_pro_with_gripper/zed_link", (-1.20, 0.0, 0.45), (0.0, 0.0, 180.0), 18.0),
+                ("/r1_pro_with_gripper/zed_link", (-1.20, 0.0, 0.45), (0.0, 0.0, 180.0), 18.0),
             ],
             "left_gripper": [
-                ("/Root/r1_pro_with_gripper/left_realsense_link", (-0.06, 0.0, 0.0), (18.0, 90.0, 0.0), 16.0),
-                ("/Root/r1_pro_with_gripper/left_gripper_link", (-0.12, 0.0, 0.0), (18.0, 90.0, 0.0), 16.0),
-                ("/r1_pro_with_gripper/left_realsense_link", (-0.06, 0.0, 0.0), (18.0, 90.0, 0.0), 16.0),
-                ("/r1_pro_with_gripper/left_gripper_link", (-0.12, 0.0, 0.0), (18.0, 90.0, 0.0), 16.0),
+                ("/Root/r1_pro_with_gripper/left_realsense_link", (-0.12, 0.0, 0.02), (0.0, 0.0, 180.0), 16.0),
+                ("/Root/r1_pro_with_gripper/left_gripper_link", (-0.12, 0.0, 0.02), (0.0, 0.0, 180.0), 16.0),
+                ("/r1_pro_with_gripper/left_realsense_link", (-0.12, 0.0, 0.02), (0.0, 0.0, 180.0), 16.0),
+                ("/r1_pro_with_gripper/left_gripper_link", (-0.12, 0.0, 0.02), (0.0, 0.0, 180.0), 16.0),
             ],
             "right_gripper": [
-                ("/Root/r1_pro_with_gripper/right_realsense_link", (-0.06, 0.0, 0.0), (18.0, 90.0, 0.0), 16.0),
-                ("/Root/r1_pro_with_gripper/right_gripper_link", (-0.12, 0.0, 0.0), (18.0, 90.0, 0.0), 16.0),
-                ("/r1_pro_with_gripper/right_realsense_link", (-0.06, 0.0, 0.0), (18.0, 90.0, 0.0), 16.0),
-                ("/r1_pro_with_gripper/right_gripper_link", (-0.12, 0.0, 0.0), (18.0, 90.0, 0.0), 16.0),
+                ("/Root/r1_pro_with_gripper/right_realsense_link", (-0.12, 0.0, 0.02), (0.0, 0.0, 180.0), 16.0),
+                ("/Root/r1_pro_with_gripper/right_gripper_link", (-0.12, 0.0, 0.02), (0.0, 0.0, 180.0), 16.0),
+                ("/r1_pro_with_gripper/right_realsense_link", (-0.12, 0.0, 0.02), (0.0, 0.0, 180.0), 16.0),
+                ("/r1_pro_with_gripper/right_gripper_link", (-0.12, 0.0, 0.02), (0.0, 0.0, 180.0), 16.0),
             ],
         }
         aliases = {}
@@ -1304,21 +1577,13 @@ def main() -> None:
 
     def _build_ranger_camera_aliases(scene_prim_path: str) -> dict[str, str]:
         head_candidates = [
-            ("/base_footprint", (0.45, 0.0, 1.25), (18.0, 0.0, 0.0), 18.0),
-            ("/base_link", (0.45, 0.0, 1.25), (18.0, 0.0, 0.0), 18.0),
-            ("/chassis_link", (0.45, 0.0, 1.25), (18.0, 0.0, 0.0), 18.0),
-            ("/body", (0.45, 0.0, 1.25), (18.0, 0.0, 0.0), 18.0),
+            ("/base_footprint", (0.18, 0.0, 1.45), (6.0, 0.0, 0.0), 18.0),
+            ("/base_link", (0.18, 0.0, 1.45), (6.0, 0.0, 0.0), 18.0),
+            ("/chassis_link", (0.18, 0.0, 1.45), (6.0, 0.0, 0.0), 18.0),
+            ("/body", (0.18, 0.0, 1.45), (6.0, 0.0, 0.0), 18.0),
         ]
-        left_body = getattr(args, "left_ee_body", "left_eef_link")
-        right_body = getattr(args, "right_ee_body", "right_eef_link")
         link_candidates = {
             "head_top": head_candidates,
-            "left_gripper": [
-                (f"/{left_body}", (0.18, 0.0, 0.04), (18.0, -90.0, 0.0), 16.0),
-            ],
-            "right_gripper": [
-                (f"/{right_body}", (0.18, 0.0, 0.04), (18.0, -90.0, 0.0), 16.0),
-            ],
         }
         aliases = {}
         for alias, candidates in link_candidates.items():
@@ -1337,6 +1602,20 @@ def main() -> None:
                     break
         return aliases
 
+    def _build_drone_camera_aliases(drone_name: str, scene_prim_path: str) -> dict[str, str]:
+        camera_path = _upsert_follow_camera(
+            drone_name,
+            scene_prim_path,
+            "chase",
+            scene_prim_path,
+            (-1.2, 0.0, 0.45),
+            (12.0, 0.0, 0.0),
+            18.0,
+        )
+        if camera_path is not None and stage.GetPrimAtPath(camera_path).IsValid():
+            return {"chase": camera_path}
+        return {}
+
     def _update_robot_camera_rigs():
         for rig in robot_camera_rigs.values():
             try:
@@ -1347,7 +1626,17 @@ def main() -> None:
             body_quat_gf = _quat_wxyz_to_gf(body_quat)
             body_rotation = Gf.Rotation(body_quat_gf)
             world_position = body_rotation.TransformDir(rig["local_offset"]) + Gf.Vec3d(*body_pos)
-            world_rotation = body_quat_gf * rig["local_rotation"]
+            adjustment = Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), float(rig["adjust_yaw_deg"]))
+            adjustment *= Gf.Rotation(Gf.Vec3d(1.0, 0.0, 0.0), float(rig["adjust_pitch_deg"]))
+            adjustment_quat = Gf.Quatf(
+                float(adjustment.GetQuat().GetReal()),
+                Gf.Vec3f(
+                    float(adjustment.GetQuat().GetImaginary()[0]),
+                    float(adjustment.GetQuat().GetImaginary()[1]),
+                    float(adjustment.GetQuat().GetImaginary()[2]),
+                ),
+            )
+            world_rotation = body_quat_gf * rig["base_local_rotation"] * adjustment_quat
             rig["translate_op"].Set(world_position)
             rig["rotate_op"].Set(world_rotation)
 
@@ -1374,7 +1663,7 @@ def main() -> None:
                 dtype=np.float64,
             )
             position_error = float(np.linalg.norm(camera_pos - expected_position_np))
-            carb.log_warn(
+            carb.log_info(
                 f"{robot_name} camera validated: {alias}, body={rig['body_path']}, camera={camera_path}, "
                 f"position_error={position_error:.6f}"
             )
@@ -1390,8 +1679,38 @@ def main() -> None:
             carb.log_warn("No active viewport found; cannot switch camera.")
             return False
         viewport.camera_path = camera_path
+        active_camera_control["robot_name"] = active_robot
+        active_camera_control["alias"] = camera_alias
         active_camera = viewport.camera_path.pathString if hasattr(viewport.camera_path, "pathString") else str(viewport.camera_path)
-        carb.log_warn(f"Viewport switched to {active_robot} camera: {camera_alias} -> {active_camera}")
+        carb.log_info(f"Viewport switched to {active_robot} camera: {camera_alias} -> {active_camera}")
+        return True
+
+    def _switch_named_camera(robot_name: str, camera_alias: str = "chase") -> bool:
+        camera_path = robot_camera_aliases.get(robot_name, {}).get(camera_alias)
+        if not camera_path:
+            carb.log_warn(f"{robot_name} camera '{camera_alias}' is unavailable on current stage.")
+            return False
+        viewport = get_active_viewport()
+        if viewport is None:
+            carb.log_warn("No active viewport found; cannot switch camera.")
+            return False
+        viewport.camera_path = camera_path
+        active_camera_control["robot_name"] = robot_name
+        active_camera_control["alias"] = camera_alias
+        active_camera = viewport.camera_path.pathString if hasattr(viewport.camera_path, "pathString") else str(viewport.camera_path)
+        carb.log_info(f"Viewport switched to {robot_name} camera: {camera_alias} -> {active_camera}")
+        return True
+
+    def _adjust_active_camera(delta_yaw_deg: float, delta_pitch_deg: float) -> bool:
+        robot_name = active_camera_control.get("robot_name")
+        alias = active_camera_control.get("alias")
+        if not robot_name or not alias:
+            return False
+        rig = robot_camera_rigs.get((robot_name, alias))
+        if rig is None:
+            return False
+        rig["adjust_yaw_deg"] = float(rig["adjust_yaw_deg"]) + float(delta_yaw_deg)
+        rig["adjust_pitch_deg"] = max(-85.0, min(85.0, float(rig["adjust_pitch_deg"]) + float(delta_pitch_deg)))
         return True
 
     if args.add_r1pro:
@@ -1467,7 +1786,7 @@ def main() -> None:
     prim = stage.GetPrimAtPath(prim_path)
     wrapped_prim_path = f"{wrapper_path}/ranger_arm"
     if not prim.IsValid() and stage.GetPrimAtPath(wrapped_prim_path).IsValid():
-        carb.log_warn(f"Prim {prim_path} not found; using existing wrapped prim {wrapped_prim_path}.")
+        carb.log_info(f"Prim {prim_path} not found; using existing wrapped prim {wrapped_prim_path}.")
         prim_path = wrapped_prim_path
         prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid():
@@ -1692,7 +2011,7 @@ def main() -> None:
             f"Manual stage animation ops: {len(stage_animation_ops)} "
             f"(station loaded={station.IsLoaded()}, source={args.station_animation_usd})"
         )
-        carb.log_warn(message)
+        carb.log_info(message)
         print(message, flush=True)
         if stage_animation_ops:
             _apply_stage_animation_pose(animation_start_seconds)
@@ -1819,9 +2138,16 @@ def main() -> None:
     if stage.GetPrimAtPath(robot_root_path).IsValid():
         _clear_existing_robot_cameras("ranger_arm", robot_root_path)
         robot_camera_aliases["ranger_arm"] = _build_ranger_camera_aliases(robot_root_path)
+    for drone_name in ("cf2x", "cf2x_01"):
+        drone_scene_path = f"/World/{drone_name}"
+        if stage.GetPrimAtPath(drone_scene_path).IsValid():
+            _clear_existing_robot_cameras(drone_name, drone_scene_path)
+            robot_camera_aliases[drone_name] = _build_drone_camera_aliases(drone_name, drone_scene_path)
     _update_robot_camera_rigs()
     _validate_robot_camera_rigs("r1pro")
     _validate_robot_camera_rigs("ranger_arm")
+    _validate_robot_camera_rigs("cf2x")
+    _validate_robot_camera_rigs("cf2x_01")
 
     if args.add_r1pro and args.r1pro_physics and stage.GetPrimAtPath(r1pro_articulation_prim_path).IsValid():
         try:
@@ -1863,7 +2189,7 @@ def main() -> None:
                 carb.log_warn(
                     f"Ranger arm IK ready. Active arm: {active_ik_mode}. "
                     "W/S drive base forward/back, A/D steer base left/right; "
-                    "TAB switches left/right/both; use I/K, J/L, U/O, T/G, F/H, R/Y, 3/4 for 7-DOF joints; "
+                    "TAB switches left/right/both; use I/K, J/L, U/O, T/G, F/H, R/Y, 7/8 for 7-DOF joints; "
                     "M/N open/close gripper."
                 )
         except Exception as exc:  # noqa: BLE001
@@ -1888,8 +2214,8 @@ def main() -> None:
             carb.log_warn(
                 f"r1pro teleop ready. Active gripper target: {r1pro_controller.active_target_mode}. "
                 "Use F1 or 2 to switch robot, W/S forward-back, A/D steer, Q/E yaw (r1pro only), "
-                "TAB to switch left/right/both arms, 3/4 for arm joint7, 5/6 for torso yaw, "
-                "M/N to open/close, F6/F7/F8 to switch cameras."
+                "TAB to switch left/right/both arms, 7/8 for arm joint7, 5/6 for torso yaw, "
+                "M/N to open/close, F6/F7/F8 to switch robot cameras, F9/F10 to switch drone cameras."
             )
         except Exception as exc:  # noqa: BLE001
             carb.log_warn(f"Failed to build r1pro teleop controller: {exc}")
@@ -1897,65 +2223,17 @@ def main() -> None:
 
     for robot_name, camera_aliases in robot_camera_aliases.items():
         for alias, camera_path in camera_aliases.items():
-            carb.log_warn(f"{robot_name} camera ready: {alias} -> {camera_path}")
+            carb.log_info(f"{robot_name} camera ready: {alias} -> {camera_path}")
 
     dispatcher = TeleopDispatcher([ranger_controller, r1pro_controller])
     if r1pro_controller is not None and dispatcher.set_active("r1pro"):
-        carb.log_warn("Active teleop controller switched to: r1pro")
+        carb.log_info("Active teleop controller switched to: r1pro")
     target_reach = None
-    if args.enable_target_reach:
-        target_height_z = args.ground_z + args.target_height
-        default_target_points = (
-            (args.r1pro_x + args.target_forward_offset, args.r1pro_y - args.target_spread, target_height_z),
-            (args.r1pro_x + args.target_forward_offset + 0.35, args.r1pro_y, target_height_z + 0.10),
-            (args.r1pro_x + args.target_forward_offset, args.r1pro_y + args.target_spread, target_height_z),
-        )
-        try:
-            target_positions = parse_target_points(args.target_points, default_target_points)
-            target_markers = TargetMarkerManager(
-                stage,
-                Gf,
-                UsdGeom,
-                UsdPhysics,
-                args.target_marker_root,
-                args.target_marker_size,
-            )
-            target_reach = TargetReachCoordinator(
-                target_markers.create_targets(target_positions),
-                EndEffectorTargetReacher(
-                    get_world_pose,
-                    carb,
-                    tolerance=args.target_reach_tolerance,
-                    max_step=args.target_reach_speed * args.dt,
-                    hold_orientation=args.target_reach_hold_orientation,
-                ),
-                enabled=True,
-            )
-            active_target = target_reach.active_target
-            if active_target is not None:
-                carb.log_warn(
-                    f"Target reach enabled. Active target: {active_target.name} at "
-                    f"{active_target.position.tolist()}. Use 7/8/9 to select targets, 0 to toggle."
-                )
-        except Exception as exc:  # noqa: BLE001
-            target_reach = None
-            carb.log_warn(f"Failed to initialize target reach markers: {exc}")
     time_code = Usd.TimeCode.Default()
     cfg = TeleopConfig(speed=args.speed, turn_rate=args.turn_rate, lift_rate=args.lift_rate)
 
     def _keyboard_inputs(*names):
         return [key for name in names if (key := getattr(carb.input.KeyboardInput, name, None)) is not None]
-
-    target_reach_key_groups = [
-        (0, _keyboard_inputs("KEY_7", "NUMPAD_7", "NUM_7", "KP_7")),
-        (1, _keyboard_inputs("KEY_8", "NUMPAD_8", "NUM_8", "KP_8")),
-        (2, _keyboard_inputs("KEY_9", "NUMPAD_9", "NUM_9", "KP_9")),
-    ]
-    target_reach_toggle_keys = _keyboard_inputs("KEY_0", "NUMPAD_0", "NUM_0", "KP_0")
-    target_reach_key_down = {0: False, 1: False, 2: False, "toggle": False}
-
-    def _any_key_down(key_group) -> bool:
-        return any(keyboard.pressed(key) or keyboard.poll_pressed(key) for key in key_group)
 
     keys = [
         carb.input.KeyboardInput.W,
@@ -1971,20 +2249,21 @@ def main() -> None:
         carb.input.KeyboardInput.J,
         carb.input.KeyboardInput.L,
         carb.input.KeyboardInput.F1,
+        carb.input.KeyboardInput.F2,
         carb.input.KeyboardInput.F6,
         carb.input.KeyboardInput.F7,
         carb.input.KeyboardInput.F8,
+        carb.input.KeyboardInput.F9,
+        carb.input.KeyboardInput.F10,
         carb.input.KeyboardInput.KEY_1,
         carb.input.KeyboardInput.KEY_2,
         carb.input.KeyboardInput.KEY_3,
         carb.input.KeyboardInput.KEY_4,
         carb.input.KeyboardInput.KEY_5,
+        carb.input.KeyboardInput.KEY_7,
+        carb.input.KeyboardInput.KEY_8,
         carb.input.KeyboardInput.KEY_6,
     ]
-    if target_reach is not None:
-        for _, target_keys in target_reach_key_groups:
-            keys.extend(target_keys)
-        keys.extend(target_reach_toggle_keys)
     if dispatcher is not None and dispatcher.active_name is not None:
         keys.extend(
             [
@@ -2035,9 +2314,10 @@ def main() -> None:
         carb.log_info(
             f"Teleop ready. Active controller: {dispatcher.active_name}. "
             "Use F1 or 1/2 to switch robot; W/S drive forward-back; A/D steer base; "
-            "TAB switches left/right/both; I/K J/L U/O T/G F/H R/Y 3/4 drive 7-DOF arm joints; "
+            "TAB switches left/right/both; I/K J/L U/O T/G F/H R/Y 7/8 drive 7-DOF arm joints; "
             "5/6 torso yaw; "
-            "M/N gripper; F6/F7/F8 switch active robot cameras."
+            "M/N gripper; F6/F7/F8 switch active robot cameras; F9/F10 switch drone cameras; "
+            "3/4 select drone teleop, F2 returns to robot teleop."
         )
     else:
         carb.log_info("Teleop ready. Focus the viewport and use W/S/A/D for base. ESC to quit.")
@@ -2050,19 +2330,20 @@ def main() -> None:
         carb.log_info("Entering teleop loop.")
         last_heartbeat = time.time()
         last_selection_clear = 0.0
-        last_target_reach_log = 0.0
         while True:
             _advance_stage_animation()
             asset_controller.apply_locked_poses()
+            _apply_drone_trajectories()
             if robot_articulation is not None or r1pro_articulation is not None:
                 my_world.step(render=True)
             else:
                 sim_app.update()
             _update_robot_camera_rigs()
             asset_controller.apply_locked_poses()
+            _apply_drone_trajectories()
             time.sleep(0.001)
 
-            if args.clear_ui_selection and target_reach is None and time.time() - last_selection_clear > 1.0:
+            if args.clear_ui_selection and time.time() - last_selection_clear > 1.0:
                 _clear_stage_selection()
                 last_selection_clear = time.time()
 
@@ -2085,70 +2366,104 @@ def main() -> None:
                 active_name = dispatcher.cycle_active()
                 if active_name is not None:
                     carb.log_warn(f"Active teleop controller switched to: {active_name}")
-            if keyboard.consume_pressed(carb.input.KeyboardInput.KEY_1) and dispatcher.set_active("ranger_arm"):
-                carb.log_warn("Active teleop controller switched to: ranger_arm")
-            if keyboard.consume_pressed(carb.input.KeyboardInput.KEY_2) and dispatcher.set_active("r1pro"):
-                carb.log_warn("Active teleop controller switched to: r1pro")
+                else:
+                    carb.log_warn("No available teleop controller is registered.")
+            key_1_pressed = keyboard.consume_pressed(carb.input.KeyboardInput.KEY_1)
+            if key_1_pressed:
+                active_control_context["kind"] = "robot"
+                active_control_context["path"] = None
+                if dispatcher.set_active("ranger_arm"):
+                    carb.log_warn("Active teleop controller switched to: ranger_arm")
+                else:
+                    carb.log_warn(f"ranger_arm controller is unavailable. Registered controllers: {dispatcher.names()}")
+            key_2_pressed = keyboard.consume_pressed(carb.input.KeyboardInput.KEY_2)
+            if key_2_pressed:
+                active_control_context["kind"] = "robot"
+                active_control_context["path"] = None
+                if dispatcher.set_active("r1pro"):
+                    carb.log_warn("Active teleop controller switched to: r1pro")
+                else:
+                    carb.log_warn(f"r1pro controller is unavailable. Registered controllers: {dispatcher.names()}")
+            if keyboard.consume_pressed(carb.input.KeyboardInput.F2):
+                active_control_context["kind"] = "robot"
+                active_control_context["path"] = None
+                carb.log_warn(f"Keyboard control returned to robot teleop: {dispatcher.active_name}")
             if keyboard.consume_pressed(carb.input.KeyboardInput.F6):
                 _switch_robot_camera("head_top")
             if keyboard.consume_pressed(carb.input.KeyboardInput.F7):
                 _switch_robot_camera("left_gripper")
             if keyboard.consume_pressed(carb.input.KeyboardInput.F8):
                 _switch_robot_camera("right_gripper")
+            if keyboard.consume_pressed(carb.input.KeyboardInput.F9):
+                _switch_named_camera("cf2x", "chase")
+            if keyboard.consume_pressed(carb.input.KeyboardInput.F10):
+                _switch_named_camera("cf2x_01", "chase")
+            if keyboard.consume_pressed(carb.input.KeyboardInput.KEY_3):
+                drone_state = drone_states_by_path.get("/World/cf2x")
+                if drone_state is not None:
+                    drone_state["manual_override"] = True
+                    active_control_context["kind"] = "drone"
+                    active_control_context["path"] = "/World/cf2x"
+                    carb.log_warn("Drone teleop selected: cf2x. Use W/S A/D Q/E J/L to move.")
+                else:
+                    carb.log_warn("cf2x is unavailable for manual teleop.")
+            if keyboard.consume_pressed(carb.input.KeyboardInput.KEY_4):
+                drone_state = drone_states_by_path.get("/World/cf2x_01")
+                if drone_state is not None:
+                    drone_state["manual_override"] = True
+                    active_control_context["kind"] = "drone"
+                    active_control_context["path"] = "/World/cf2x_01"
+                    carb.log_warn("Drone teleop selected: cf2x_01. Use W/S A/D Q/E J/L to move.")
+                else:
+                    carb.log_warn("cf2x_01 is unavailable for manual teleop.")
             if keyboard.consume_pressed(carb.input.KeyboardInput.TAB):
                 target_mode = dispatcher.cycle_target_mode()
                 if target_mode is not None:
                     carb.log_warn(f"{dispatcher.active_name} active target switched to: {target_mode}")
-            if target_reach is not None:
-                for target_index, target_keys in target_reach_key_groups:
-                    is_down = _any_key_down(target_keys)
-                    if is_down and not target_reach_key_down[target_index]:
-                        active_target = target_reach.set_active_index(target_index)
-                        if active_target is not None:
-                            active_controller = dispatcher.active_controller() if dispatcher is not None else None
-                            active_arm = getattr(active_controller, "active_target_mode", "unknown")
-                            carb.log_warn(
-                                f"Active reach target switched to: {active_target.name} for robot={dispatcher.active_name}, arm={active_arm}"
-                            )
-                    target_reach_key_down[target_index] = is_down
-                toggle_down = _any_key_down(target_reach_toggle_keys)
-                if toggle_down and not target_reach_key_down["toggle"]:
-                    enabled = target_reach.toggle_enabled()
-                    carb.log_warn(f"Target reach {'enabled' if enabled else 'disabled'}.")
-                target_reach_key_down["toggle"] = toggle_down
+
+            camera_yaw_step = 4.0
+            camera_pitch_step = 3.0
+            if keyboard.pressed(carb.input.KeyboardInput.LEFT) or keyboard.poll_pressed(carb.input.KeyboardInput.LEFT):
+                _adjust_active_camera(-camera_yaw_step, 0.0)
+            if keyboard.pressed(carb.input.KeyboardInput.RIGHT) or keyboard.poll_pressed(carb.input.KeyboardInput.RIGHT):
+                _adjust_active_camera(camera_yaw_step, 0.0)
+            if keyboard.pressed(carb.input.KeyboardInput.UP) or keyboard.poll_pressed(carb.input.KeyboardInput.UP):
+                _adjust_active_camera(0.0, -camera_pitch_step)
+            if keyboard.pressed(carb.input.KeyboardInput.DOWN) or keyboard.poll_pressed(carb.input.KeyboardInput.DOWN):
+                _adjust_active_camera(0.0, camera_pitch_step)
 
             forward = float(
                 keyboard.pressed(carb.input.KeyboardInput.W)
-                or keyboard.pressed(carb.input.KeyboardInput.UP)
                 or keyboard.poll_pressed(carb.input.KeyboardInput.W)
-                or keyboard.poll_pressed(carb.input.KeyboardInput.UP)
             ) - float(
                 keyboard.pressed(carb.input.KeyboardInput.S)
-                or keyboard.pressed(carb.input.KeyboardInput.DOWN)
                 or keyboard.poll_pressed(carb.input.KeyboardInput.S)
-                or keyboard.poll_pressed(carb.input.KeyboardInput.DOWN)
             )
             strafe = float(
                 keyboard.pressed(carb.input.KeyboardInput.D)
-                or keyboard.pressed(carb.input.KeyboardInput.RIGHT)
                 or keyboard.poll_pressed(carb.input.KeyboardInput.D)
-                or keyboard.poll_pressed(carb.input.KeyboardInput.RIGHT)
             ) - float(
                 keyboard.pressed(carb.input.KeyboardInput.A)
-                or keyboard.pressed(carb.input.KeyboardInput.LEFT)
                 or keyboard.poll_pressed(carb.input.KeyboardInput.A)
-                or keyboard.poll_pressed(carb.input.KeyboardInput.LEFT)
             )
             lift = float(
                 keyboard.pressed(carb.input.KeyboardInput.E) or keyboard.poll_pressed(carb.input.KeyboardInput.E)
             ) - float(
                 keyboard.pressed(carb.input.KeyboardInput.Q) or keyboard.poll_pressed(carb.input.KeyboardInput.Q)
             )
+            drone_yaw = float(
+                keyboard.pressed(carb.input.KeyboardInput.L) or keyboard.poll_pressed(carb.input.KeyboardInput.L)
+            ) - float(
+                keyboard.pressed(carb.input.KeyboardInput.J) or keyboard.poll_pressed(carb.input.KeyboardInput.J)
+            )
             active_controller_name = dispatcher.active_name if dispatcher is not None else None
             ranger_arm_is_active = active_controller_name == "ranger_arm"
             r1pro_is_active = active_controller_name == "r1pro"
             yaw = 0.0
-            if r1pro_is_active:
+            drone_control_active = active_control_context["kind"] == "drone" and active_control_context["path"] in drone_states_by_path
+            if drone_control_active:
+                yaw = drone_yaw
+            elif r1pro_is_active:
                 yaw = float(
                     keyboard.pressed(carb.input.KeyboardInput.E) or keyboard.poll_pressed(carb.input.KeyboardInput.E)
                 ) - float(
@@ -2169,6 +2484,33 @@ def main() -> None:
                     lift = float(ui_models["lift"].model.get_value_as_float())
                 if ui_models["yaw"] is not None:
                     yaw = float(ui_models["yaw"].model.get_value_as_float())
+
+            if drone_control_active:
+                active_drone_state = drone_states_by_path[active_control_context["path"]]
+                linear_step = 1.2 * args.dt
+                vertical_step = 0.8 * args.dt
+                yaw_step = 75.0 * args.dt
+                yaw_rad = math.radians(float(active_drone_state["yaw_deg"]))
+                forward_dir = np.array([math.cos(yaw_rad), math.sin(yaw_rad)], dtype=np.float64)
+                right_dir = np.array([-math.sin(yaw_rad), math.cos(yaw_rad)], dtype=np.float64)
+                planar_delta = (forward * forward_dir + strafe * right_dir) * linear_step
+                active_drone_state["translation"] = Gf.Vec3d(
+                    float(active_drone_state["translation"][0]) + float(planar_delta[0]),
+                    float(active_drone_state["translation"][1]) + float(planar_delta[1]),
+                    float(active_drone_state["translation"][2]) + lift * vertical_step,
+                )
+                active_drone_state["yaw_deg"] = float(active_drone_state["yaw_deg"]) + yaw * yaw_step
+                target_pitch_deg = -10.0 * forward
+                target_roll_deg = -8.0 * strafe
+                active_drone_state["pitch_deg"] = 0.8 * float(active_drone_state.get("pitch_deg", 0.0)) + 0.2 * target_pitch_deg
+                active_drone_state["roll_deg"] = 0.8 * float(active_drone_state.get("roll_deg", 0.0)) + 0.2 * target_roll_deg
+                control_effort = min(1.0, abs(forward) + abs(strafe) + abs(lift) + abs(yaw))
+                active_drone_state["rotor_speed_deg_per_sec"] = 720.0 + 1080.0 * control_effort
+                _apply_drone_manual_pose(active_drone_state)
+                forward = 0.0
+                strafe = 0.0
+                lift = 0.0
+                yaw = 0.0
 
             arm_target_delta = np.zeros(3, dtype=np.float32)
             arm_rotation_delta = np.zeros(3, dtype=np.float32)
@@ -2244,20 +2586,20 @@ def main() -> None:
                     )
                 if ranger_arm_is_active and arm_ik_enabled:
                     joint7_axis = float(
-                        keyboard.pressed(carb.input.KeyboardInput.KEY_3)
-                        or keyboard.poll_pressed(carb.input.KeyboardInput.KEY_3)
+                        keyboard.pressed(carb.input.KeyboardInput.KEY_7)
+                        or keyboard.poll_pressed(carb.input.KeyboardInput.KEY_7)
                     ) - float(
-                        keyboard.pressed(carb.input.KeyboardInput.KEY_4)
-                        or keyboard.poll_pressed(carb.input.KeyboardInput.KEY_4)
+                        keyboard.pressed(carb.input.KeyboardInput.KEY_8)
+                        or keyboard.poll_pressed(carb.input.KeyboardInput.KEY_8)
                     )
                     ranger_joint_delta[6] = joint7_axis * args.ik_rotation_speed * args.dt * 2.0
                 elif r1pro_is_active:
                     joint7_axis = float(
-                        keyboard.pressed(carb.input.KeyboardInput.KEY_3)
-                        or keyboard.poll_pressed(carb.input.KeyboardInput.KEY_3)
+                        keyboard.pressed(carb.input.KeyboardInput.KEY_7)
+                        or keyboard.poll_pressed(carb.input.KeyboardInput.KEY_7)
                     ) - float(
-                        keyboard.pressed(carb.input.KeyboardInput.KEY_4)
-                        or keyboard.poll_pressed(carb.input.KeyboardInput.KEY_4)
+                        keyboard.pressed(carb.input.KeyboardInput.KEY_8)
+                        or keyboard.poll_pressed(carb.input.KeyboardInput.KEY_8)
                     )
                     joint7_delta = joint7_axis * args.ik_rotation_speed * args.dt
                 if r1pro_is_active:
@@ -2303,30 +2645,6 @@ def main() -> None:
                 or torso_has_input
                 or gripper_delta != 0.0
             )
-            target_reach_should_step = bool(
-                target_reach is not None
-                and target_reach.enabled
-                and dispatcher is not None
-                and dispatcher.active_controller() is not None
-                and not arm_has_input
-            )
-            target_base_status = None
-            if target_reach_should_step and args.target_base_motion and not base_has_input:
-                target_base_status = target_reach.base_status(
-                    dispatcher.active_controller(),
-                    desired_distance=args.target_base_distance,
-                )
-                auto_forward, auto_strafe, auto_yaw = target_reach.base_command(
-                    dispatcher.active_controller(),
-                    desired_distance=args.target_base_distance,
-                    max_command=args.target_base_command,
-                )
-                if auto_forward != 0.0 or auto_strafe != 0.0 or auto_yaw != 0.0:
-                    forward = auto_forward
-                    strafe = auto_strafe
-                    yaw = auto_yaw
-                    lift = 0.0
-                    base_has_input = True
             if args.debug_input and (base_has_input or arm_has_input):
                 carb.log_info(
                     f"Input state f={forward} s={strafe} z={lift} yaw={yaw} "
@@ -2335,11 +2653,12 @@ def main() -> None:
                 )
 
             active_controller = dispatcher.active_controller() if dispatcher is not None else None
+            if drone_control_active:
+                active_controller = None
             if (
                 active_controller is None
                 and not base_has_input
                 and not arm_has_input
-                and not target_reach_should_step
             ):
                 continue
 
@@ -2362,21 +2681,8 @@ def main() -> None:
                         gripper_delta=gripper_delta,
                     ),
                 )
-            if target_reach is not None:
-                if target_base_status is None:
-                    target_base_status = target_reach.base_status(
-                        dispatcher.active_controller(),
-                        desired_distance=args.target_base_distance,
-                    )
-                should_log_target = time.time() - last_target_reach_log > 5.0
-                if should_log_target and target_base_status.active:
-                    last_target_reach_log = time.time()
-                    distance_text = "n/a" if target_base_status.distance_xy is None else f"{target_base_status.distance_xy:.4f}"
-                    carb.log_warn(
-                        f"Target distance: robot={target_base_status.robot_name}, "
-                        f"target={target_base_status.target_name}, distance_xy={distance_text}, "
-                        f"reached_area={target_base_status.within_distance}"
-                    )
+                _update_robot_camera_rigs()
+                _apply_drone_trajectories()
     except Exception:
         carb.log_error("Unhandled exception in teleop loop.")
         import traceback  # noqa: WPS433

@@ -32,10 +32,26 @@ TIANGONG_ASSET_ROOT = Path(
 ).resolve()
 """优先使用的本地资产根目录绝对路径。"""
 
+TIANGONG_ISAAC_ASSET_ROOT = os.environ.get("TIANGONG_ISAAC_ASSET_ROOT", "").strip()
+"""可选的 Isaac 资产镜像根目录，形如 /path/to/isaac_assets。"""
+
 
 def local_asset_path(*parts: str) -> str:
     """返回配置资产根目录下的绝对路径。"""
     return str(TIANGONG_ASSET_ROOT.joinpath(*parts).resolve())
+
+
+def isaac_asset_path(*parts: str) -> str:
+    """返回 Isaac 资产路径，优先外部镜像，缺失时回退到项目资产根。"""
+    candidates: list[Path] = []
+    if TIANGONG_ISAAC_ASSET_ROOT:
+        candidates.append(Path(TIANGONG_ISAAC_ASSET_ROOT).expanduser())
+    candidates.append(TIANGONG_ASSET_ROOT)
+    for root in candidates:
+        candidate = root.joinpath(*parts).resolve()
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[0].joinpath(*parts).resolve())
 
 
 def tkmodel_usd_path() -> str:
@@ -46,8 +62,8 @@ def tkmodel_usd_path() -> str:
 TIANGONG_SPACE_STATION_ASSET_PATH = str(
     (TIANGONG_PROJECT_ASSETS_ROOT / "tiangong_scene" / "Tiangong Space Station.usd").resolve()
 )
-CF2X_ASSET_PATH = local_asset_path("Assets", "Isaac", "5.1", "Isaac", "Robots", "Bitcraze", "Crazyflie", "cf2x.usd")
-RANGER_ARM_ASSET_PATH = local_asset_path(
+CF2X_ASSET_PATH = isaac_asset_path("Assets", "Isaac", "5.1", "Isaac", "Robots", "Bitcraze", "Crazyflie", "cf2x.usd")
+RANGER_ARM_ASSET_PATH = isaac_asset_path(
     "Assets", "Isaac", "5.1", "Isaac", "Robots", "Clearpath", "RidgebackFranka", "ridgeback_franka.usd"
 )
 RANGER_ARM_CONFIG_ASSET_PATH = str(
