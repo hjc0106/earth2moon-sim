@@ -1,6 +1,6 @@
 # 天宫场景机器人整体操作流程
 
-本文档描述当前天宫 IsaacSim 场景中的整体操作流程：场景加载、机器人控制器创建、键盘遥操作、目标点创建，以及 Ranger Arm / R1 Pro 底座如何先移动到目标区域。
+本文档描述当前天宫 IsaacSim 场景中的整体操作流程：场景加载、机器人控制器创建、键盘遥操作、目标点创建、四旋翼轨迹跟踪，以及 Ranger Arm / R1 Pro 底座如何先移动到目标区域。
 
 ## 运行入口
 
@@ -31,14 +31,17 @@ flowchart TD
     C --> E[加载 Ranger Arm]
     C --> F[加载 R1 Pro]
     C --> G[创建目标点小方块]
+    C --> Q[加载四旋翼和 RGB-D 相机]
 
     E --> H[RangerArmTeleopController]
     H --> I[RangerArmIKSolver]
 
     F --> J[R1ProTeleopController]
+    Q --> R[QuadrotorTrajectoryController]
 
     H --> K[TeleopDispatcher]
     J --> K
+    R --> K
     G --> L[TargetReachCoordinator]
 
     K --> M[手动遥操作]
@@ -58,6 +61,7 @@ flowchart TD
 | `teleop/ranger_arm_controller.py` | Ranger Arm 底盘和双臂控制入口。 |
 | `teleop/ranger_arm_ik.py` | Ranger Arm 差分 IK 求解。 |
 | `teleop/r1pro_controller.py` | R1 Pro 底盘、躯干、双臂和夹爪控制。 |
+| `teleop/quadrotor_controller.py` | 四旋翼运行时资产加载、RGB-D 相机创建、CSV/JSON 轨迹跟踪和暂停后的手动运动。 |
 | `teleop/target_reach.py` | 目标点小方块、目标点解析、底座到目标区域的实时距离与靠近命令；末端逼近代码保留但当前暂停调用。 |
 | `teleop/drone_controller.py` | 展示资产固定、地面贴合和位姿锁定。 |
 | `utils/assets.py` | 项目内 USD 资产路径解析。 |
@@ -69,7 +73,8 @@ flowchart TD
     A[进入 while True] --> B[推进天宫装配动画]
     B --> C[锁定展示资产位姿]
     C --> D[World.step render=True]
-    D --> E[读取键盘]
+    D --> P[推进四旋翼轨迹]
+    P --> E[读取键盘]
     E --> F[处理 F1 / 1 / 2 / TAB / 7 / 8 / 9 / 0]
     F --> G[生成 BaseMotionCommand]
     F --> H[生成 ManipulatorMotionCommand]

@@ -27,7 +27,7 @@ def _ensure_tiangong_on_path() -> None:
 
 _ensure_tiangong_on_path()
 
-from tiangong.utils.assets import TIANGONG_SPACE_STATION_ASSET_PATH, tkmodel_usd_path
+from tiangong.utils.assets import CF2X_ASSET_PATH, TIANGONG_SPACE_STATION_ASSET_PATH, tkmodel_usd_path
 
 
 def default_r1pro_usd_path() -> str:
@@ -38,6 +38,28 @@ def default_r1pro_usd_path() -> str:
         if candidate.exists():
             return str(candidate)
     return str(candidates[0])
+
+
+def default_quadrotor_usd_path() -> str:
+    """返回默认四旋翼 USD 路径，优先使用本地 IsaacSim 资产镜像。"""
+    return CF2X_ASSET_PATH
+
+
+def _resolve_quadrotor_usd_path(quadrotor_usd: str, isaac_asset_root: str) -> str:
+    """解析四旋翼 USD；显式路径不存在时尝试从 IsaacSim 资产根推导。"""
+    requested_path = Path(quadrotor_usd).expanduser()
+    if requested_path.exists() or not isaac_asset_root:
+        return str(requested_path)
+    root = Path(isaac_asset_root).expanduser()
+    candidates = (
+        root / "Assets" / "Isaac" / "5.1" / "Isaac" / "Robots" / "Bitcraze" / "Crazyflie" / "cf2x.usd",
+        root / "Isaac" / "Robots" / "Bitcraze" / "Crazyflie" / "cf2x.usd",
+        root / "Robots" / "Bitcraze" / "Crazyflie" / "cf2x.usd",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(requested_path)
 
 
 @dataclass
@@ -604,6 +626,205 @@ def main() -> None:
         help="Uniform scale applied to /World/cf2x and /World/cf2x_01 when grounding them.",
     )
     parser.add_argument(
+        "--add-quadrotor",
+        action="store_true",
+        help="Add a kinematic quadrotor with an RGB-D camera to the scene.",
+    )
+    parser.add_argument(
+        "--quadrotor-count",
+        type=int,
+        default=4,
+        help="Number of quadrotors to spawn. Trajectories are loaded as {trajectory-dir}/1.csv, 2.csv, ...",
+    )
+    parser.add_argument(
+        "--quadrotor-usd",
+        type=str,
+        default=default_quadrotor_usd_path(),
+        help="Path to the IsaacSim Crazyflie/cf2x USD used for the quadrotor.",
+    )
+    parser.add_argument(
+        "--quadrotor-prim",
+        type=str,
+        default="/World/quadrotor",
+        help="Prim path for the added quadrotor.",
+    )
+    parser.add_argument(
+        "--quadrotor-trajectory-dir",
+        type=str,
+        default="assets/trajectories/quadrotor",
+        help="Directory containing numbered quadrotor trajectories: 1.csv, 2.csv, ... up to --quadrotor-count.",
+    )
+    parser.add_argument(
+        "--quadrotor-loop-trajectory",
+        action="store_true",
+        help="Loop the quadrotor trajectory after it reaches the final waypoint.",
+    )
+    parser.add_argument(
+        "--quadrotor-autostart",
+        action="store_true",
+        default=True,
+        help="Start quadrotor trajectory playback immediately when a trajectory is provided.",
+    )
+    parser.add_argument(
+        "--no-quadrotor-autostart",
+        action="store_false",
+        dest="quadrotor_autostart",
+        help="Load the quadrotor trajectory but keep it paused until F3 is pressed.",
+    )
+    parser.add_argument("--quadrotor-x", type=float, default=0.0, help="Initial quadrotor world X when no trajectory is loaded.")
+    parser.add_argument("--quadrotor-y", type=float, default=-3.0, help="Initial quadrotor world Y when no trajectory is loaded.")
+    parser.add_argument(
+        "--quadrotor-altitude",
+        type=float,
+        default=2.4,
+        help="Initial quadrotor altitude above --ground-z when no trajectory is loaded.",
+    )
+    parser.add_argument("--quadrotor-yaw", type=float, default=0.0, help="Initial quadrotor yaw in degrees.")
+    parser.add_argument(
+        "--quadrotor-scale",
+        type=float,
+        default=1.0,
+        help="Uniform scale applied to the added quadrotor.",
+    )
+    parser.add_argument(
+        "--quadrotor-manual-speed",
+        type=float,
+        default=0.5,
+        help="Manual quadrotor translation speed in meters per second when trajectory is paused.",
+    )
+    parser.add_argument(
+        "--quadrotor-manual-yaw-rate",
+        type=float,
+        default=45.0,
+        help="Manual quadrotor yaw rate in degrees per second when trajectory is paused.",
+    )
+    parser.add_argument(
+        "--show-quadrotor-camera",
+        action="store_true",
+        default=False,
+        help="Switch the active viewport to the quadrotor RGB-D camera after startup.",
+    )
+    parser.add_argument(
+        "--no-show-quadrotor-camera",
+        action="store_false",
+        dest="show_quadrotor_camera",
+        help="Do not automatically switch the viewport to the quadrotor camera.",
+    )
+    parser.add_argument(
+        "--show-quadrotor-camera-window",
+        action="store_true",
+        default=True,
+        help="Show the quadrotor RGB-D feed in an external Matplotlib window.",
+    )
+    parser.add_argument(
+        "--no-show-quadrotor-camera-window",
+        action="store_false",
+        dest="show_quadrotor_camera_window",
+        help="Disable the external Matplotlib RGB-D camera window.",
+    )
+    parser.add_argument(
+        "--quadrotor-camera-window-hz",
+        type=float,
+        default=10.0,
+        help="Update rate for the external quadrotor RGB-D camera window.",
+    )
+    parser.add_argument(
+        "--quadrotor-depth-max",
+        type=float,
+        default=20.0,
+        help="Maximum displayed depth in meters for the external quadrotor depth view.",
+    )
+    parser.add_argument(
+        "--quadrotor-camera-pitch",
+        type=float,
+        default=90.0,
+        help="Downward camera pitch in degrees around the quadrotor body X axis. 90 looks straight down for overview.",
+    )
+    parser.add_argument(
+        "--quadrotor-physics",
+        action="store_true",
+        default=True,
+        help="Use the physics-based 6-DOF SE3 flight controller (rigid body + gravity + rotor joints). Recommended.",
+    )
+    parser.add_argument(
+        "--no-quadrotor-physics",
+        action="store_false",
+        dest="quadrotor_physics",
+        help="Use the legacy kinematic quadrotor controller (teleports the prim, no flight dynamics).",
+    )
+    parser.add_argument(
+        "--quadrotor-physics-kp-pos",
+        type=float,
+        default=6.0,
+        help="Physics quadrotor position proportional gain (acceleration per meter of error).",
+    )
+    parser.add_argument(
+        "--quadrotor-physics-kd-pos",
+        type=float,
+        default=3.0,
+        help="Physics quadrotor position derivative gain (acceleration per m/s of velocity error).",
+    )
+    parser.add_argument(
+        "--quadrotor-physics-k-att",
+        type=float,
+        default=8.0e-3,
+        help="Physics quadrotor attitude (rotation error) gain -> body torque.",
+    )
+    parser.add_argument(
+        "--quadrotor-physics-k-omega",
+        type=float,
+        default=1.5e-3,
+        help="Physics quadrotor angular velocity error gain -> body torque.",
+    )
+    parser.add_argument(
+        "--quadrotor-physics-max-thrust",
+        type=float,
+        default=None,
+        help="Max total thrust in Newtons. Defaults to 4x hover thrust (4*m*g).",
+    )
+    parser.add_argument(
+        "--quadrotor-physics-max-torque",
+        type=float,
+        default=0.01,
+        help="Max body torque per axis in Newton*meters.",
+    )
+    parser.add_argument(
+        "--quadrotor-physics-rotor-spin",
+        type=float,
+        default=1200.0,
+        help="Rotor visual spin target velocity in rad/s (m1/m3 CW, m2/m4 CCW).",
+    )
+    parser.add_argument(
+        "--quadrotor-obstacle-avoidance",
+        action="store_true",
+        default=False,
+        help="Enable APF obstacle avoidance using the quadrotor RGB-D depth camera.",
+    )
+    parser.add_argument(
+        "--quadrotor-apf-range",
+        type=float,
+        default=1.5,
+        help="APF obstacle detection range in meters. Obstacles closer than this generate repulsive force.",
+    )
+    parser.add_argument(
+        "--quadrotor-apf-strength",
+        type=float,
+        default=2.0,
+        help="APF repulsive force coefficient (eta). Lower = gentler avoidance, higher = stronger push.",
+    )
+    parser.add_argument(
+        "--quadrotor-apf-min-distance",
+        type=float,
+        default=0.3,
+        help="Minimum distance clamp for APF to avoid singularity (meters).",
+    )
+    parser.add_argument(
+        "--quadrotor-apf-depth-step",
+        type=int,
+        default=12,
+        help="Pixel step for subsampling the depth image (12 = every 12th pixel). Lower = denser, slower.",
+    )
+    parser.add_argument(
         "--ground-z",
         type=float,
         default=-10.0,
@@ -811,11 +1032,19 @@ def main() -> None:
         DroneAssetController,
         EndEffectorTargetReacher,
         ManipulatorMotionCommand,
+        QuadrotorFleetController,
+        QuadrotorMatplotlibCameraViewer,
+        QuadrotorMatplotlibFleetCameraViewer,
+        QuadrotorPhysicsTrajectoryController,
+        QuadrotorTrajectoryController,
         R1ProTeleopController,
         RangerArmTeleopController,
         TargetMarkerManager,
         TargetReachCoordinator,
         TeleopDispatcher,
+        load_quadrotor_trajectory,
+        resolve_quadrotor_prim_paths,
+        resolve_quadrotor_trajectory_paths,
         parse_target_points,
     )
 
@@ -1117,6 +1346,165 @@ def main() -> None:
                 scale=args.drone_scale,
             )
 
+    quadrotor_controller = None
+    quadrotor_physics_active = False
+    if args.add_quadrotor:
+        quadrotor_count = max(int(args.quadrotor_count), 1)
+        quadrotor_asset_path = _resolve_quadrotor_usd_path(args.quadrotor_usd, args.isaac_asset_root)
+        quadrotor_prim_paths = resolve_quadrotor_prim_paths(args.quadrotor_prim, quadrotor_count)
+        fleet_resolution = (640, 480) if quadrotor_count == 1 else (320, 240)
+        will_have_robot_articulation = bool(args.drive_wheels or args.enable_arm_ik)
+        will_have_r1pro_articulation = bool(args.add_r1pro and args.r1pro_physics)
+        if args.quadrotor_physics and not will_have_robot_articulation and not will_have_r1pro_articulation:
+            try:
+                if my_world.is_stopped():
+                    my_world.play()
+                carb.log_warn(f"Physics timeline playing for quadrotor-only scene.")
+            except Exception as exc:  # noqa: BLE001
+                carb.log_warn(f"Failed to start physics timeline for quadrotor: {exc}")
+        try:
+            trajectory_paths = resolve_quadrotor_trajectory_paths(
+                quadrotor_count,
+                args.quadrotor_trajectory_dir,
+            )
+            carb.log_warn(
+                f"Resolved quadrotor trajectories: count={quadrotor_count}, "
+                f"dir={args.quadrotor_trajectory_dir}, files={trajectory_paths}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            trajectory_paths = []
+            carb.log_warn(f"Failed to resolve quadrotor trajectories: {exc}")
+        quadrotor_members: list[QuadrotorTrajectoryController] = []
+        quadrotor_controller_cls = (
+            QuadrotorPhysicsTrajectoryController if args.quadrotor_physics else QuadrotorTrajectoryController
+        )
+        if args.quadrotor_physics and args.quadrotor_scale != 1.0:
+            carb.log_warn(
+                "Physics quadrotor is best used with --quadrotor-scale 1.0; the dynamics use the authored Crazyflie "
+                "mass/inertia regardless of visual scale. A non-unit scale only resizes collision/visual."
+            )
+        for index, prim_path in enumerate(quadrotor_prim_paths):
+            quadrotor_trajectory = []
+            trajectory_path = trajectory_paths[index] if index < len(trajectory_paths) else ""
+            if trajectory_path:
+                try:
+                    quadrotor_trajectory = load_quadrotor_trajectory(trajectory_path)
+                    carb.log_warn(
+                        f"Loaded quadrotor trajectory[{index + 1}]: {trajectory_path}, "
+                        f"waypoints={len(quadrotor_trajectory)}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    carb.log_warn(f"Failed to load quadrotor trajectory {trajectory_path}: {exc}")
+            quadrotor_initial_position = (args.quadrotor_x, args.quadrotor_y, args.ground_z + args.quadrotor_altitude)
+            if quadrotor_trajectory:
+                quadrotor_initial_position = tuple(float(value) for value in quadrotor_trajectory[0].position)
+            try:
+                controller_kwargs = dict(
+                    stage=stage,
+                    sim_app=sim_app,
+                    carb=carb,
+                    gf_module=Gf,
+                    sdf_module=Sdf,
+                    usd_module=Usd,
+                    usdgeom_module=UsdGeom,
+                    usdphysics_module=UsdPhysics,
+                    prim_path=prim_path,
+                    asset_path=quadrotor_asset_path,
+                    initial_position=quadrotor_initial_position,
+                    initial_yaw_deg=args.quadrotor_yaw,
+                    scale=args.quadrotor_scale,
+                    trajectory=quadrotor_trajectory,
+                    loop_trajectory=args.quadrotor_loop_trajectory,
+                    autostart=args.quadrotor_autostart,
+                    manual_speed=args.quadrotor_manual_speed,
+                    manual_yaw_rate_deg=args.quadrotor_manual_yaw_rate,
+                    manual_dt=args.dt,
+                    camera_resolution=fleet_resolution,
+                    camera_pitch_deg=args.quadrotor_camera_pitch,
+                    label=f"quadrotor_{index + 1}",
+                )
+                if args.quadrotor_physics:
+                    controller_kwargs.update(
+                        world=my_world,
+                        gravity=9.81,
+                        kp_pos=args.quadrotor_physics_kp_pos,
+                        kd_pos=args.quadrotor_physics_kd_pos,
+                        k_att=args.quadrotor_physics_k_att,
+                        k_omega=args.quadrotor_physics_k_omega,
+                        max_thrust=args.quadrotor_physics_max_thrust,
+                        max_torque=args.quadrotor_physics_max_torque,
+                        rotor_spin_velocity=args.quadrotor_physics_rotor_spin,
+                        obstacle_avoidance=args.quadrotor_obstacle_avoidance,
+                        apf_range=args.quadrotor_apf_range,
+                        apf_strength=args.quadrotor_apf_strength,
+                        apf_min_distance=args.quadrotor_apf_min_distance,
+                        apf_depth_step=args.quadrotor_apf_depth_step,
+                    )
+                member = quadrotor_controller_cls(**controller_kwargs)
+                if member.available:
+                    quadrotor_members.append(member)
+            except Exception as exc:  # noqa: BLE001
+                carb.log_warn(f"Failed to initialize quadrotor {prim_path}: {exc}")
+        if quadrotor_members:
+            quadrotor_controller = QuadrotorFleetController(quadrotor_members)
+            carb.log_warn(
+                f"Quadrotor fleet ready: count={len(quadrotor_members)}, "
+                f"prims={[member.prim_path for member in quadrotor_members]}"
+            )
+        else:
+            carb.log_warn("No quadrotors were initialized successfully.")
+
+    quadrotor_physics_active = (
+        quadrotor_controller is not None
+        and quadrotor_controller.available
+        and any(isinstance(member, QuadrotorPhysicsTrajectoryController) for member in quadrotor_controller.controllers)
+    )
+    if args.quadrotor_obstacle_avoidance and quadrotor_controller is not None:
+        try:
+            obstacle_path = "/World/obstacle_test_box"
+            obstacle_size = 0.3
+            obstacle_pos = (3.0, 2.5, -0.5)
+            obstacle_prim = UsdGeom.Cube.Define(stage, obstacle_path)
+            obstacle_prim.GetSizeAttr().Set(obstacle_size)
+            xf = UsdGeom.Xformable(obstacle_prim)
+            try:
+                xf.ClearXformOpOrder()
+            except Exception:
+                pass
+            translate_op = xf.AddTranslateOp()
+            translate_op.Set(Gf.Vec3d(*obstacle_pos))
+            UsdPhysics.CollisionAPI.Apply(obstacle_prim.GetPrim())
+            rb = UsdPhysics.RigidBodyAPI.Apply(obstacle_prim.GetPrim())
+            rb.CreateKinematicEnabledAttr(True)
+            rb.CreateRigidBodyEnabledAttr(True)
+            UsdPhysics.MassAPI.Apply(obstacle_prim.GetPrim()).CreateMassAttr().Set(100.0)
+            carb.log_warn(
+                f"Test obstacle created at {obstacle_pos}, size={obstacle_size}m "
+                f"(kinematic, collision enabled) for APF avoidance test."
+            )
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"Failed to create test obstacle: {exc}")
+    if quadrotor_physics_active:
+        try:
+            if my_world.is_stopped():
+                my_world.play()
+            for _ in range(6):
+                sim_app.update()
+            for member in quadrotor_controller.controllers:
+                if isinstance(member, QuadrotorPhysicsTrajectoryController) and member.available:
+                    member.initialize_physics_view()
+            for _ in range(3):
+                my_world.step(render=True)
+            for member in quadrotor_controller.controllers:
+                if isinstance(member, QuadrotorPhysicsTrajectoryController) and member.available:
+                    member.reset_to_setpoint()
+            carb.log_warn(
+                f"Quadrotor physics finalized: sim_view={my_world.physics_sim_view is not None}, "
+                f"playing={my_world.is_playing()}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"Failed to finalize physics world for quadrotor: {exc}")
+
     if args.r1pro_display_only and args.r1pro_prim != "/World/r1pro":
         asset_controller.make_display_only("/World/r1pro")
 
@@ -1136,7 +1524,7 @@ def main() -> None:
         return f"{scene_prim_path}/base_link"
 
     r1pro_articulation_prim_path = _resolve_r1pro_articulation_prim_path(r1pro_scene_prim_path)
-    robot_camera_aliases = {"r1pro": {}, "ranger_arm": {}}
+    robot_camera_aliases = {"r1pro": {}, "ranger_arm": {}, "quadrotor": {}}
     robot_camera_rigs = {}
 
     def _get_world_pose_safe_for_path(prim_path: str):
@@ -1819,6 +2207,8 @@ def main() -> None:
     if stage.GetPrimAtPath(robot_root_path).IsValid():
         _clear_existing_robot_cameras("ranger_arm", robot_root_path)
         robot_camera_aliases["ranger_arm"] = _build_ranger_camera_aliases(robot_root_path)
+    if quadrotor_controller is not None and quadrotor_controller.available:
+        robot_camera_aliases["quadrotor"] = quadrotor_controller.camera_aliases()
     _update_robot_camera_rigs()
     _validate_robot_camera_rigs("r1pro")
     _validate_robot_camera_rigs("ranger_arm")
@@ -1895,13 +2285,65 @@ def main() -> None:
             carb.log_warn(f"Failed to build r1pro teleop controller: {exc}")
             r1pro_controller = None
 
+    if quadrotor_controller is not None and quadrotor_controller.available:
+        carb.log_warn(
+            "Quadrotor fleet teleop ready. Use F2 to switch to quadrotor, F3 pause/resume all trajectories, "
+            "F4 reset all trajectories, W/S A/D Q/E Z/X for manual motion on the active quadrotor while paused, "
+            "F6 cycles viewport among quadrotor cameras when multiple are active."
+        )
+
     for robot_name, camera_aliases in robot_camera_aliases.items():
         for alias, camera_path in camera_aliases.items():
             carb.log_warn(f"{robot_name} camera ready: {alias} -> {camera_path}")
 
-    dispatcher = TeleopDispatcher([ranger_controller, r1pro_controller])
+    dispatcher = TeleopDispatcher([ranger_controller, r1pro_controller, quadrotor_controller])
     if r1pro_controller is not None and dispatcher.set_active("r1pro"):
         carb.log_warn("Active teleop controller switched to: r1pro")
+    elif quadrotor_controller is not None and dispatcher.set_active("quadrotor"):
+        carb.log_warn("Active teleop controller switched to: quadrotor")
+    if args.show_quadrotor_camera and quadrotor_controller is not None and quadrotor_controller.available:
+        previous_active_name = dispatcher.active_name
+        if dispatcher.set_active("quadrotor"):
+            _switch_robot_camera("head_top")
+            if previous_active_name is not None and previous_active_name != "quadrotor":
+                dispatcher.set_active(previous_active_name)
+    quadrotor_camera_viewer = None
+    if (
+        args.show_quadrotor_camera_window
+        and quadrotor_controller is not None
+        and quadrotor_controller.available
+        and not args.headless
+    ):
+        carb.log_warn("Initializing external Matplotlib quadrotor RGB-D camera window.")
+        if len(quadrotor_controller.controllers) == 1:
+            single_controller = quadrotor_controller.controllers[0]
+            quadrotor_camera_viewer = QuadrotorMatplotlibCameraViewer(
+                single_controller.camera_path,
+                carb,
+                resolution=single_controller.camera_resolution,
+                update_period=1.0 / max(args.quadrotor_camera_window_hz, 1e-3),
+                depth_max=args.quadrotor_depth_max,
+            )
+            quadrotor_camera_viewer.initialize()
+        else:
+            camera_specs = [
+                (controller.camera_path, controller.label) for controller in quadrotor_controller.controllers
+            ]
+            quadrotor_camera_viewer = QuadrotorMatplotlibFleetCameraViewer(
+                camera_specs,
+                carb,
+                resolution=quadrotor_controller.camera_resolution,
+                update_period=1.0 / max(args.quadrotor_camera_window_hz, 1e-3),
+                depth_max=args.quadrotor_depth_max,
+            )
+            quadrotor_camera_viewer.initialize()
+        for _ in range(5):
+            sim_app.update()
+    elif args.show_quadrotor_camera_window:
+        carb.log_warn(
+            "External quadrotor camera window skipped: requires --add-quadrotor, successful quadrotor load, "
+            "and non-headless IsaacSim."
+        )
     target_reach = None
     if args.enable_target_reach:
         target_height_z = args.ground_z + args.target_height
@@ -1971,6 +2413,9 @@ def main() -> None:
         carb.input.KeyboardInput.J,
         carb.input.KeyboardInput.L,
         carb.input.KeyboardInput.F1,
+        carb.input.KeyboardInput.F2,
+        carb.input.KeyboardInput.F3,
+        carb.input.KeyboardInput.F4,
         carb.input.KeyboardInput.F6,
         carb.input.KeyboardInput.F7,
         carb.input.KeyboardInput.F8,
@@ -2034,10 +2479,10 @@ def main() -> None:
     if dispatcher is not None and dispatcher.active_name is not None:
         carb.log_info(
             f"Teleop ready. Active controller: {dispatcher.active_name}. "
-            "Use F1 or 1/2 to switch robot; W/S drive forward-back; A/D steer base; "
+            "Use F1 or 1/2/F2 to switch robot; W/S drive forward-back; A/D steer base; "
             "TAB switches left/right/both; I/K J/L U/O T/G F/H R/Y 3/4 drive 7-DOF arm joints; "
             "5/6 torso yaw; "
-            "M/N gripper; F6/F7/F8 switch active robot cameras."
+            "M/N gripper; F3/F4 control quadrotor trajectory; F6/F7/F8 switch active robot cameras."
         )
     else:
         carb.log_info("Teleop ready. Focus the viewport and use W/S/A/D for base. ESC to quit.")
@@ -2054,10 +2499,14 @@ def main() -> None:
         while True:
             _advance_stage_animation()
             asset_controller.apply_locked_poses()
-            if robot_articulation is not None or r1pro_articulation is not None:
+            if quadrotor_controller is not None:
+                quadrotor_controller.update(args.dt)
+            if robot_articulation is not None or r1pro_articulation is not None or quadrotor_physics_active:
                 my_world.step(render=True)
             else:
                 sim_app.update()
+            if quadrotor_camera_viewer is not None:
+                quadrotor_camera_viewer.update(time.time())
             _update_robot_camera_rigs()
             asset_controller.apply_locked_poses()
             time.sleep(0.001)
@@ -2089,8 +2538,26 @@ def main() -> None:
                 carb.log_warn("Active teleop controller switched to: ranger_arm")
             if keyboard.consume_pressed(carb.input.KeyboardInput.KEY_2) and dispatcher.set_active("r1pro"):
                 carb.log_warn("Active teleop controller switched to: r1pro")
+            if keyboard.consume_pressed(carb.input.KeyboardInput.F2) and dispatcher.set_active("quadrotor"):
+                carb.log_warn("Active teleop controller switched to: quadrotor")
+            if keyboard.consume_pressed(carb.input.KeyboardInput.F3) and quadrotor_controller is not None:
+                playing = quadrotor_controller.toggle_playing()
+                carb.log_warn(f"Quadrotor fleet trajectory {'playing' if playing else 'paused'}.")
+            if keyboard.consume_pressed(carb.input.KeyboardInput.F4) and quadrotor_controller is not None:
+                quadrotor_controller.reset_trajectory()
+                carb.log_warn("Quadrotor fleet trajectory reset.")
             if keyboard.consume_pressed(carb.input.KeyboardInput.F6):
-                _switch_robot_camera("head_top")
+                if (
+                    dispatcher is not None
+                    and dispatcher.active_name == "quadrotor"
+                    and quadrotor_controller is not None
+                    and len(quadrotor_controller.controllers) > 1
+                ):
+                    camera_alias = quadrotor_controller.cycle_viewport_camera()
+                    if camera_alias is not None:
+                        _switch_robot_camera(camera_alias)
+                else:
+                    _switch_robot_camera("head_top")
             if keyboard.consume_pressed(carb.input.KeyboardInput.F7):
                 _switch_robot_camera("left_gripper")
             if keyboard.consume_pressed(carb.input.KeyboardInput.F8):
@@ -2147,6 +2614,7 @@ def main() -> None:
             active_controller_name = dispatcher.active_name if dispatcher is not None else None
             ranger_arm_is_active = active_controller_name == "ranger_arm"
             r1pro_is_active = active_controller_name == "r1pro"
+            quadrotor_is_active = active_controller_name == "quadrotor"
             yaw = 0.0
             if r1pro_is_active:
                 yaw = float(
@@ -2159,6 +2627,12 @@ def main() -> None:
                 yaw = -strafe
                 strafe = 0.0
                 lift = 0.0
+            elif quadrotor_is_active:
+                yaw = float(
+                    keyboard.pressed(carb.input.KeyboardInput.X) or keyboard.poll_pressed(carb.input.KeyboardInput.X)
+                ) - float(
+                    keyboard.pressed(carb.input.KeyboardInput.Z) or keyboard.poll_pressed(carb.input.KeyboardInput.Z)
+                )
             if args.use_ui:
                 # Always read live slider values to avoid missed callbacks.
                 if ui_models["forward"] is not None:
