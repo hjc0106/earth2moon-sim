@@ -1,0 +1,26 @@
+[package]
+
+# Semantic Versioning is used: https://semver.org/
+version = "0.1.0"
+
+# Description
+category = "isaaclab"
+readme  = "README.md"
+
+title = "Tiangong Tasks"
+author = "Earth2Moon Sim Project Developers"
+maintainer = "Earth2Moon Sim Project Developers"
+description="IsaacLab tasks for the Earth-to-Moon space station digital simulation platform (VR teleoperation)."
+repository = "https://github.com/isaac-sim/IsaacLab.git"
+keywords = ["extension", "tiangong", "isaaclab", "vr", "teleop"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+"isaaclab_tasks" = {}
+# NOTE: Add additional dependencies here
+
+[[python.module]]
+name = "tiangong_tasks"
+
+[isaaclab_settings]
