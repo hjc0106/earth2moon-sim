@@ -35,13 +35,12 @@
 
 轮式机器人相机切换依赖当前激活机器人：
 
+- `F1`：返回启动时的全场景视角
 - `1`：切到 `ranger_arm`
 - `2`：切到 `r1pro`
 - `F6`：当前激活轮式机器人的 `head_top`
-- `F7`：当前激活机器人的 `left_gripper`  
-  仅 `r1pro` 可用
-- `F8`：当前激活机器人的 `right_gripper`  
-  仅 `r1pro` 可用
+- `F3`：切到 `ranger_arm.head_top`，同时选择 Ranger VR 控制
+- `F4`：切到 `r1pro.head_top`，同时选择 R1 Pro VR 控制
 
 无人机相机直接绑定：
 

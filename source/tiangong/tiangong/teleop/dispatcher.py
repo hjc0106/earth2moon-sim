@@ -89,3 +89,17 @@ class TeleopDispatcher:
         if controller is None:
             return
         controller.step(base_command, manipulator_command)
+
+    def active_joint_position_snapshot(self) -> dict[str, float]:
+        """读取当前激活机器人所有 DOF 的实时关节位置。"""
+        controller = self.active_controller()
+        if controller is None or not hasattr(controller, "joint_position_snapshot"):
+            return {}
+        return controller.joint_position_snapshot()
+
+    def active_robot_feedback_snapshot(self) -> dict:
+        """读取当前激活机器人的位姿、关节位置和关节力矩反馈。"""
+        controller = self.active_controller()
+        if controller is None or not hasattr(controller, "robot_feedback_snapshot"):
+            return {}
+        return controller.robot_feedback_snapshot()

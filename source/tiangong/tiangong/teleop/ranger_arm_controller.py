@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 from isaacsim.core.utils.types import ArticulationAction
 
-from .ranger_arm_ik import RangerArmIKSolver
+from .ranger_arm_ik import RangerArmIKSolver, normalize_quat
 
 
 class RangerArmTeleopController:
@@ -68,6 +68,57 @@ class RangerArmTeleopController:
     def _joint_names(self, paths) -> list[str]:
         """把关节路径压缩成名字，便于启动日志核对 DOF 分类。"""
         return [str(path).rsplit("/", 1)[-1] for path in paths]
+
+    def joint_position_snapshot(self) -> dict[str, float]:
+        """返回当前 articulation 所有 DOF 的关节位置。"""
+        if not self.available:
+            return {}
+        try:
+            positions = np.asarray(self.articulation.get_joint_positions(), dtype=np.float32).reshape(-1)
+            names = list(self.articulation.dof_names)
+        except Exception as exc:
+            self.carb.log_warn(f"Could not read Ranger Arm joint positions: {exc}")
+            return {}
+        return {str(name): float(positions[index]) for index, name in enumerate(names[: positions.size])}
+
+    def joint_unit_snapshot(self) -> dict[str, tuple[str, str]]:
+        """返回各 DOF position/effort 的单位说明。"""
+        if not self.available:
+            return {}
+        try:
+            names = list(self.articulation.dof_names)
+            dof_types = self.articulation.dof_properties["type"]
+        except Exception:
+            return {}
+        units = {}
+        for index, name in enumerate(names[: len(dof_types)]):
+            dof_type = str(dof_types[index]).lower()
+            if "translation" in dof_type or "linear" in dof_type or str(dof_types[index]) == "1":
+                units[str(name)] = ("m", "N")
+            else:
+                units[str(name)] = ("rad", "N*m")
+        return units
+
+    def robot_feedback_snapshot(self) -> dict:
+        """返回当前机器人底座位姿、关节位置和可用的关节力矩反馈。"""
+        position, quat = self.get_base_world_pose()
+        feedback = {
+            "name": self.name,
+            "position": np.asarray(position, dtype=np.float32).reshape(-1)[:3],
+            "quat": np.asarray(quat, dtype=np.float32).reshape(-1)[:4],
+            "joint_positions": self.joint_position_snapshot(),
+            "joint_units": self.joint_unit_snapshot(),
+            "joint_efforts": {},
+        }
+        try:
+            efforts = np.asarray(self.articulation.get_measured_joint_efforts(), dtype=np.float32).reshape(-1)
+            names = list(self.articulation.dof_names)
+            feedback["joint_efforts"] = {
+                str(name): float(efforts[index]) for index, name in enumerate(names[: efforts.size])
+            }
+        except Exception:
+            pass
+        return feedback
 
     def _configure_base_drives(self):
         """配置 Ranger Arm 轮子和转向 DOF，确保速度/位置 action 能生效。"""
@@ -171,6 +222,20 @@ class RangerArmTeleopController:
         """把所有 IK 目标重置为当前末端实际位姿。"""
         if self.ik_solver is not None:
             self.ik_solver.sync_targets()
+
+    def _normalize_quat(self, quat):
+        """提供与通用 VR adapter 一致的四元数接口。"""
+        return normalize_quat(quat)
+
+    def _apply_arm_ik_targets(self, tasks) -> None:
+        """通过 Ranger 自身的差分 IK 应用末端位姿目标。"""
+        if self.ik_solver is not None:
+            self.ik_solver.apply_targets(tasks, use_orientation=True)
+
+    def _apply_gripper_targets(self, tasks) -> None:
+        """通过 Ranger 自身夹爪驱动应用目标。"""
+        if self.ik_solver is not None:
+            self.ik_solver.apply_gripper_targets(tasks)
 
     def _wheel_x_from_name(self, joint_path: str) -> float:
         """按关节名估算该轮位于底盘机械臂端还是另一端。"""
