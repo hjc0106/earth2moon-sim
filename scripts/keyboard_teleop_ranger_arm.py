@@ -2106,10 +2106,10 @@ def main() -> None:
 
     def _build_ranger_camera_aliases(scene_prim_path: str) -> dict[str, str]:
         head_candidates = [
-            ("/chassis_link", (0.50, 0.0, 1.82), (8.0, 0.0, 0.0), 18.0),
-            ("/body", (0.50, 0.0, 1.82), (8.0, 0.0, 0.0), 18.0),
-            ("/base_link", (0.50, 0.0, 1.82), (8.0, 0.0, 0.0), 18.0),
-            ("/base_footprint", (0.50, 0.0, 1.82), (8.0, 0.0, 0.0), 18.0),
+            ("/chassis_link", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
+            ("/body", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
+            ("/base_link", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
+            ("/base_footprint", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
         ]
         link_candidates = {
             "head_top": head_candidates,
@@ -3224,21 +3224,22 @@ def main() -> None:
         )
         return left_state, right_state
 
-    def _openxr_controller_local_pose(state, base_pos, base_yaw_quat):
+    def _openxr_controller_local_pose(side: str, state, base_pos, base_yaw_quat):
         """把 Quest 物理追踪坐标转换到当前机器人的作业坐标。"""
         if state is None:
             return None, None
         del base_pos, base_yaw_quat
+        controller_pos = np.asarray(state.position, dtype=np.float32)
+        controller_quat = np.asarray(state.quat_wxyz, dtype=np.float32)
+        del side
         # OpenXR: +X 向右、+Y 向上、-Z 向前。
-        # R1 Pro 作业方向为机体 +X；Ranger 机械臂作业方向为机体 -X。
-        if dispatcher.active_name == "ranger_arm":
-            tracking_to_robot_quat = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
-        else:
-            tracking_to_robot_quat = np.array([0.5, 0.5, -0.5, -0.5], dtype=np.float32)
-        local_pos = _rotate_vec_by_quat(tracking_to_robot_quat, np.asarray(state.position, dtype=np.float32))
+        # 当前 VR 里让两台车都以机体 +X 作为“视角前方/作业前方”，
+        # 这样头部相机、底盘前进和双臂手柄推前的方向保持一致。
+        tracking_to_robot_quat = np.array([0.5, 0.5, -0.5, -0.5], dtype=np.float32)
+        local_pos = _rotate_vec_by_quat(tracking_to_robot_quat, controller_pos)
         local_quat = _normalize_quat(
             _quat_multiply(
-                _quat_multiply(tracking_to_robot_quat, np.asarray(state.quat_wxyz, dtype=np.float32)),
+                _quat_multiply(tracking_to_robot_quat, controller_quat),
                 _quat_conjugate(tracking_to_robot_quat),
             )
         )
@@ -3275,6 +3276,7 @@ def main() -> None:
             )
             state = {"left": left_state, "right": right_state}[task["side"]]
             controller_local_pos, controller_local_quat = _openxr_controller_local_pose(
+                task["side"],
                 state,
                 openxr_vr_calibration_pose["base_pos"],
                 openxr_vr_calibration_pose["base_yaw_quat"],
@@ -3283,6 +3285,43 @@ def main() -> None:
             openxr_vr_calibration_task_pose[f"{task['side']}_local_quat"] = ee_local_quat
             openxr_vr_calibration_task_pose[f"{task['side']}_controller_local_pos"] = controller_local_pos
             openxr_vr_calibration_task_pose[f"{task['side']}_controller_local_quat"] = controller_local_quat
+
+    def _refresh_openxr_vr_calibration_for_side(side: str, state) -> bool:
+        """只刷新单侧 VR 零位，避免开底盘的同侧手柄把机械臂目标拖丢。"""
+        if not openxr_vr_calibrated:
+            return False
+        controller = _active_openxr_controller()
+        if controller is None or state is None:
+            return False
+        if openxr_vr_calibration_pose.get("robot_name") != dispatcher.active_name:
+            return False
+        task = next((item for item in controller.arm_ik_tasks if item.get("side") == side), None)
+        if task is None:
+            return False
+        base_pos_now, base_quat_now = controller.get_base_world_pose()
+        base_pos_now = np.asarray(base_pos_now, dtype=np.float32)
+        base_yaw_quat_now = _yaw_only_quat(base_quat_now)
+        current_pos, current_quat = controller._get_world_pose_safe(task["body_path"])
+        current_pos = np.asarray(current_pos, dtype=np.float32)
+        current_quat = _normalize_quat(np.asarray(current_quat, dtype=np.float32))
+        ee_local_pos = _rotate_vec_by_quat(_quat_conjugate(base_yaw_quat_now), current_pos - base_pos_now)
+        ee_local_quat = _normalize_quat(_quat_multiply(_quat_conjugate(base_yaw_quat_now), current_quat))
+        controller_local_pos, controller_local_quat = _openxr_controller_local_pose(
+            side,
+            state,
+            base_pos_now,
+            base_yaw_quat_now,
+        )
+        openxr_vr_calibration_pose["base_pos"] = base_pos_now.copy()
+        openxr_vr_calibration_pose["base_quat"] = _normalize_quat(base_quat_now)
+        openxr_vr_calibration_pose["base_yaw_quat"] = base_yaw_quat_now.copy()
+        openxr_vr_calibration_task_pose[f"{side}_pos"] = current_pos
+        openxr_vr_calibration_task_pose[f"{side}_quat"] = current_quat
+        openxr_vr_calibration_task_pose[f"{side}_local_pos"] = ee_local_pos
+        openxr_vr_calibration_task_pose[f"{side}_local_quat"] = ee_local_quat
+        openxr_vr_calibration_task_pose[f"{side}_controller_local_pos"] = controller_local_pos
+        openxr_vr_calibration_task_pose[f"{side}_controller_local_quat"] = controller_local_quat
+        return True
 
     def _get_active_xr_anchor_target_pose():
         """读取当前遥操作机器人的头部相机，不依赖桌面 viewport 状态。"""
@@ -3452,6 +3491,7 @@ def main() -> None:
             controller_reference_quat = openxr_vr_calibration_task_pose[f"{side}_controller_local_quat"]
 
             controller_local_pos_now, controller_local_quat_now = _openxr_controller_local_pose(
+                side,
                 state,
                 base_pos_now,
                 base_yaw_quat_now,
@@ -3832,6 +3872,14 @@ def main() -> None:
                     if openxr_vr_calibrated:
                         _update_openxr_head_anchor_with_limits()
                         openxr_vr_base_control = _build_openxr_vr_base_control(openxr_left_state, openxr_right_state)
+                        if (
+                            dispatcher.active_name == "ranger_arm"
+                            and (
+                                abs(openxr_vr_base_control.get("base_forward", 0.0)) > 1e-4
+                                or abs(openxr_vr_base_control.get("base_yaw", 0.0)) > 1e-4
+                            )
+                        ):
+                            _refresh_openxr_vr_calibration_for_side("left", openxr_left_state)
                         openxr_output = openxr_vr_bridge.build(openxr_left_state, openxr_right_state)
                         openxr_output = _apply_openxr_vr_calibration(
                             openxr_output,

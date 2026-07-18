@@ -110,7 +110,13 @@ class R1ProVRAdapter:
         target_gripper: float,
     ) -> None:
         """根据单侧 VR 目标更新单个控制 task。"""
-        current_pos = np.asarray(task["target_pos"], dtype=np.float32)
+        try:
+            current_pos, current_quat = self.controller._get_world_pose_safe(task["body_path"])
+            current_pos = np.asarray(current_pos, dtype=np.float32).reshape(3)
+            current_quat = self.controller._normalize_quat(np.asarray(current_quat, dtype=np.float32).reshape(4))
+        except Exception:
+            current_pos = np.asarray(task["target_pos"], dtype=np.float32).reshape(3)
+            current_quat = self.controller._normalize_quat(np.asarray(task["target_quat"], dtype=np.float32).reshape(4))
         desired_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
         alpha = float(np.clip(self.cfg.position_alpha, 0.0, 1.0))
         position_delta = alpha * (desired_pos - current_pos)
@@ -120,7 +126,6 @@ class R1ProVRAdapter:
             position_delta *= max_position_step / position_delta_norm
         task["target_pos"] = current_pos + position_delta
         desired_quat = self.controller._normalize_quat(np.asarray(target_quat_wxyz, dtype=np.float32).reshape(4))
-        current_quat = self.controller._normalize_quat(np.asarray(task["target_quat"], dtype=np.float32).reshape(4))
         rotation_alpha = float(np.clip(self.cfg.rotation_alpha, 0.0, 1.0))
         quat_dot = float(np.clip(abs(np.dot(current_quat, desired_quat)), 0.0, 1.0))
         angular_distance = 2.0 * float(np.arccos(quat_dot))
