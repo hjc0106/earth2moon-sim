@@ -7,12 +7,13 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
 WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 LOCAL_SITE_PACKAGES="${PROJECT_ROOT}/.isaaclab_site/lib/python3.11/site-packages"
+LOCAL_NATIVE_LIB_DIRS=()
 LOCAL_SOURCE_ROOT="${PROJECT_ROOT}/source/tiangong"
 LOCAL_ASSET_ROOT="${TIANGONG_LOCAL_ASSET_ROOT:-${PROJECT_ROOT}/assets}"
 
 export TIANGONG_ASSET_ROOT="${LOCAL_ASSET_ROOT}"
 export TIANGONG_PROJECT_ASSETS_ROOT="${PROJECT_ROOT}/assets"
-export TIANGONG_ISAAC_ASSET_ROOT="${TIANGONG_ISAAC_ASSET_ROOT:-}"
+export TIANGONG_ISAAC_ASSET_ROOT="${TIANGONG_ISAAC_ASSET_ROOT:-${LOCAL_ASSET_ROOT}}"
 
 if [[ -n "${ISAAC_SIM_PYTHON:-}" ]]; then
     PYTHON_CMD="${ISAAC_SIM_PYTHON}"
@@ -34,6 +35,9 @@ fi
 
 if [[ -d "${LOCAL_SITE_PACKAGES}" ]]; then
     EXTRA_PYTHONPATH+=("${LOCAL_SITE_PACKAGES}")
+    if [[ -d "${LOCAL_SITE_PACKAGES}/numpy.libs" ]]; then
+        LOCAL_NATIVE_LIB_DIRS+=("${LOCAL_SITE_PACKAGES}/numpy.libs")
+    fi
 fi
 
 if (( ${#EXTRA_PYTHONPATH[@]} > 0 )); then
@@ -44,5 +48,18 @@ if (( ${#EXTRA_PYTHONPATH[@]} > 0 )); then
         export PYTHONPATH="${EXTRA_PATH}"
     fi
 fi
+
+if (( ${#LOCAL_NATIVE_LIB_DIRS[@]} > 0 )); then
+    EXTRA_LD_PATH="$(IFS=:; echo "${LOCAL_NATIVE_LIB_DIRS[*]}")"
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        export LD_LIBRARY_PATH="${EXTRA_LD_PATH}:${LD_LIBRARY_PATH}"
+    else
+        export LD_LIBRARY_PATH="${EXTRA_LD_PATH}"
+    fi
+fi
+
+# Isaac Sim 的 python.sh 在 conda shell 里经常会落到不完整环境。
+# 这里在执行前剥掉 conda 标记变量，保留当前 shell 其他环境。
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE CONDA_PYTHON_EXE CONDA_SHLVL _CE_M _CE_CONDA
 
 exec "${PYTHON_CMD}" "$@"

@@ -167,6 +167,7 @@ class RangerArmIKSolver:
                 max_step=self.args.ik_max_joint_step,
             )
             joint_target = self._clamp_joint_positions(task["joint_indices"], joint_pos + delta_joint_pos)
+            task["joint_target"] = np.asarray(joint_target, dtype=np.float32).copy()
             self.articulation.apply_action(
                 ArticulationAction(
                     joint_positions=np.array(joint_target, dtype=np.float32),

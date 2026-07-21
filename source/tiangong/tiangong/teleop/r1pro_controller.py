@@ -34,6 +34,7 @@ class R1ProTeleopController:
         self.arm_ik_tasks = []
         self.arm_ik_enabled = False
         self.direct_joint_control = True
+        self._ik_debug_counter = 0
         self._r1pro_wheel_xy = np.array(
             [
                 [0.16897, 0.28],
@@ -97,6 +98,57 @@ class R1ProTeleopController:
             f"r1pro direct joint teleop enabled for arms/grippers. "
             f"wheel_dofs={self.wheel_indices.size}, steer_dofs={self.steer_indices.size}."
         )
+
+    def joint_position_snapshot(self) -> dict[str, float]:
+        """返回当前 articulation 所有 DOF 的关节位置。"""
+        if not self.available:
+            return {}
+        try:
+            positions = np.asarray(self.articulation.get_joint_positions(), dtype=np.float32).reshape(-1)
+            names = list(self.articulation.dof_names)
+        except Exception as exc:
+            self.carb.log_warn(f"Could not read r1pro joint positions: {exc}")
+            return {}
+        return {str(name): float(positions[index]) for index, name in enumerate(names[: positions.size])}
+
+    def joint_unit_snapshot(self) -> dict[str, tuple[str, str]]:
+        """返回各 DOF position/effort 的单位说明。"""
+        if not self.available:
+            return {}
+        try:
+            names = list(self.articulation.dof_names)
+            dof_types = self.articulation.dof_properties["type"]
+        except Exception:
+            return {}
+        units = {}
+        for index, name in enumerate(names[: len(dof_types)]):
+            dof_type = str(dof_types[index]).lower()
+            if "translation" in dof_type or "linear" in dof_type or str(dof_types[index]) == "1":
+                units[str(name)] = ("m", "N")
+            else:
+                units[str(name)] = ("rad", "N*m")
+        return units
+
+    def robot_feedback_snapshot(self) -> dict:
+        """返回当前机器人底座位姿、关节位置和可用的关节力矩反馈。"""
+        position, quat = self.get_base_world_pose()
+        feedback = {
+            "name": self.name,
+            "position": np.asarray(position, dtype=np.float32).reshape(-1)[:3],
+            "quat": np.asarray(quat, dtype=np.float32).reshape(-1)[:4],
+            "joint_positions": self.joint_position_snapshot(),
+            "joint_units": self.joint_unit_snapshot(),
+            "joint_efforts": {},
+        }
+        try:
+            efforts = np.asarray(self.articulation.get_measured_joint_efforts(), dtype=np.float32).reshape(-1)
+            names = list(self.articulation.dof_names)
+            feedback["joint_efforts"] = {
+                str(name): float(efforts[index]) for index, name in enumerate(names[: efforts.size])
+            }
+        except Exception:
+            pass
+        return feedback
 
     def _get_world_pose_safe(self, prim_path: str):
         """优先用 fabric 获取位姿，失败时回退到普通 USD 查询。"""
@@ -189,6 +241,7 @@ class R1ProTeleopController:
             "target_pos": np.array(target_pos, dtype=np.float32),
             "target_quat": np.array(target_quat, dtype=np.float32),
             "joint_target": np.array(joint_positions, dtype=np.float32),
+            "rest_joint_positions": np.array(joint_positions, dtype=np.float32),
             "gripper_closed": gripper_closed,
             "gripper_open": gripper_open,
             "gripper_target": np.array(gripper_positions, dtype=np.float32),
@@ -377,7 +430,7 @@ class R1ProTeleopController:
             )
 
     def _apply_arm_ik_targets(self, tasks):
-        """通过 Jacobian DLS 求解双臂 IK，并发送关节位置目标。"""
+        """通过位置优先的 Jacobian DLS 求解双臂 IK。"""
         jacobians = self.articulation._articulation_view.get_jacobians()
         if jacobians is None:
             return
@@ -388,19 +441,79 @@ class R1ProTeleopController:
             current_quat = np.array(current_quat, dtype=np.float32)
             position_error = task["target_pos"] - current_pos
             orientation_error = self._axis_angle_error(current_quat, task["target_quat"])
-            ik_error = np.concatenate([position_error, orientation_error]).astype(np.float32)
+
+            max_position_error = max(float(getattr(self.args, "ik_max_position_error", 0.08)), 0.0)
+            position_error_norm = float(np.linalg.norm(position_error))
+            if max_position_error > 0.0 and position_error_norm > max_position_error:
+                position_error *= max_position_error / position_error_norm
+
+            max_orientation_error = max(float(getattr(self.args, "ik_max_orientation_error", 0.20)), 0.0)
+            orientation_error_norm = float(np.linalg.norm(orientation_error))
+            if max_orientation_error > 0.0 and orientation_error_norm > max_orientation_error:
+                orientation_error *= max_orientation_error / orientation_error_norm
+
             jacobian = jacobians[0, task["jacobian_body_index"], 0:6, :][:, task["jacobian_joint_columns"]]
-            if jacobian.shape[0] != ik_error.shape[0]:
+            if jacobian.shape[0] != 6:
                 continue
+            jacobian = np.asarray(jacobian, dtype=np.float32).copy()
             joint_pos = self.articulation.get_joint_positions(task["joint_indices"])
-            delta_joint_pos = self._damped_least_squares_delta(jacobian, ik_error)
+
+            # 先严格求位置，再仅在位置任务零空间里修正手腕姿态。
+            # 这样错误或暂时不可达的控制器姿态不会把整条手臂持续推向头顶。
+            position_jacobian = jacobian[0:3, :]
+            delta_joint_pos = self._damped_least_squares_delta(position_jacobian, position_error)
+            damping = max(float(self.args.ik_damping), 1e-6)
+            identity_joint = np.eye(position_jacobian.shape[1], dtype=np.float32)
+            try:
+                position_pinv = position_jacobian.T @ np.linalg.solve(
+                    position_jacobian @ position_jacobian.T
+                    + np.eye(3, dtype=np.float32) * (damping**2),
+                    np.eye(3, dtype=np.float32),
+                )
+                position_nullspace = identity_joint - position_pinv @ position_jacobian
+                orientation_weight = max(float(getattr(self.args, "ik_orientation_weight", 0.55)), 0.0)
+                orientation_jacobian = jacobian[3:6, :] @ position_nullspace
+                orientation_delta = self._damped_least_squares_delta(
+                    orientation_jacobian,
+                    orientation_error * orientation_weight,
+                )
+                delta_joint_pos += position_nullspace @ orientation_delta
+            except np.linalg.LinAlgError:
+                pass
+
+            rest_joint_positions = np.asarray(task.get("rest_joint_positions", joint_pos), dtype=np.float32)
+            if rest_joint_positions.shape == np.asarray(joint_pos).shape:
+                jacobian_t = jacobian.T
+                try:
+                    jacobian_pinv = jacobian_t @ np.linalg.solve(
+                        jacobian @ jacobian_t + np.eye(jacobian.shape[0], dtype=np.float32) * (damping**2),
+                        np.eye(jacobian.shape[0], dtype=np.float32),
+                    )
+                    nullspace = np.eye(jacobian.shape[1], dtype=np.float32) - jacobian_pinv @ jacobian
+                    delta_joint_pos += 0.06 * (nullspace @ (rest_joint_positions - joint_pos))
+                except np.linalg.LinAlgError:
+                    pass
+
+            max_step = max(float(self.args.ik_max_joint_step), 0.0)
+            delta_norm = float(np.linalg.norm(delta_joint_pos))
+            if max_step > 0.0 and delta_norm > max_step:
+                delta_joint_pos *= max_step / delta_norm
             joint_target = self._clamp_joint_positions(task["joint_indices"], joint_pos + delta_joint_pos)
+            # 让键盘 direct-joint hold 从最新 IK 解继续，而不是下一帧写回旧姿态。
+            task["joint_target"] = np.asarray(joint_target, dtype=np.float32).copy()
             self.articulation.apply_action(
                 ArticulationAction(
                     joint_positions=np.array(joint_target, dtype=np.float32),
                     joint_indices=task["joint_indices"],
                 )
             )
+            if self._ik_debug_counter % 120 == 0:
+                self.carb.log_warn(
+                    f"r1pro VR IK {task['side']}: target={np.asarray(task['target_pos']).round(3).tolist()}, "
+                    f"actual={current_pos.round(3).tolist()}, pos_error={position_error.round(3).tolist()}, "
+                    f"rot_error={orientation_error.round(3).tolist()}, joint_step={delta_joint_pos.round(4).tolist()}"
+                )
+        self._ik_debug_counter += 1
 
     def _update_direct_arm_joint_targets(self, tasks, delta_xyz, delta_rot, joint7_delta=0.0) -> bool:
         """把键盘末端增量映射为直接关节增量，当前用于更稳定的 R1 Pro 手臂控制。"""
