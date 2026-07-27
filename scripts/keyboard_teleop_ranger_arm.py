@@ -6,6 +6,7 @@
 
 import argparse
 import csv
+import io
 import json
 import math
 import os
@@ -407,6 +408,13 @@ class RobotSwitchCommandServer:
                 return {}
             return dict(self._control_state)
 
+    def control_age_ms(self) -> float | None:
+        """Return the age of the latest UDP VR control packet, if one was received."""
+        with self._lock:
+            if self._control_timestamp <= 0.0:
+                return None
+            return max(0.0, (time.time() - self._control_timestamp) * 1000.0)
+
     def _serve(self) -> None:
         while self._running:
             try:
@@ -806,11 +814,28 @@ def main() -> None:
         help="Minimum seconds between --log-joint-positions lines.",
     )
     parser.add_argument(
+        "--enable-state-api",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Expose robot joint state and camera aliases through a local HTTP API.",
+    )
+    parser.add_argument("--state-api-host", type=str, default="127.0.0.1", help="HTTP API bind host.")
+    parser.add_argument("--state-api-port", type=int, default=8211, help="HTTP API bind port.")
+    parser.add_argument("--state-api-image-width", type=int, default=640, help="HTTP camera image width in pixels.")
+    parser.add_argument("--state-api-image-height", type=int, default=480, help="HTTP camera image height in pixels.")
+    parser.add_argument("--state-api-image-fps", type=float, default=10.0, help="Maximum HTTP camera image refresh rate.")
+    parser.add_argument(
         "--wrap-prim",
         action="store_true",
         help="Wrap the target prim under /World/ranger_arm_teleop for easier translation.",
     )
     parser.add_argument("--dt", type=float, default=1.0 / 60.0, help="Control timestep in seconds.")
+    parser.add_argument(
+        "--pace-control-loop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cap the teleop loop at 1 / --dt so fixed-dt input increments are not applied too frequently.",
+    )
     parser.add_argument(
         "--quit-on-esc",
         action="store_true",
@@ -1397,6 +1422,7 @@ def main() -> None:
         ManipulatorMotionCommand,
         R1ProTeleopController,
         RangerArmTeleopController,
+        TeleopStateApiServer,
         TeleopDispatcher,
     )
 
@@ -1533,8 +1559,6 @@ def main() -> None:
 
     _clear_stage_selection()
 
-    grounded_asset_poses = []
-
     def _make_transform_matrix(translation, rotation):
         transform = Gf.Matrix4d(1.0)
         rotation_x = Gf.Rotation(Gf.Vec3d(1.0, 0.0, 0.0), float(rotation[0]))
@@ -1543,11 +1567,6 @@ def main() -> None:
         transform.SetRotate(rotation_x * rotation_y * rotation_z)
         transform.SetTranslate(translation)
         return transform
-
-    def _apply_grounded_asset_poses() -> None:
-        for transform_op, scale_op, translation, rotation, scale in grounded_asset_poses:
-            transform_op.Set(_make_transform_matrix(translation, rotation))
-            scale_op.Set(Gf.Vec3f(scale, scale, scale))
 
     def _reset_to_single_transform_op(prim):
         xformable = UsdGeom.Xformable(prim)
@@ -1612,95 +1631,6 @@ def main() -> None:
                 prim.SetActive(False)
             prim.CreateAttribute("physxArticulation:enabledSelfCollisions", Sdf.ValueTypeNames.Bool).Set(False)
             prim.CreateAttribute("physxRigidBody:disableGravity", Sdf.ValueTypeNames.Bool).Set(True)
-
-    def _lock_asset_to_ground(prim_path, target_xy, rotation, scale=1.0) -> None:
-        asset_prim = stage.GetPrimAtPath(prim_path)
-        if not asset_prim.IsValid():
-            carb.log_warn(f"Cannot ground missing asset prim: {prim_path}")
-            return
-        try:
-            stage.Load(asset_prim.GetPath(), Usd.LoadWithDescendants)
-        except TypeError:
-            stage.Load(asset_prim.GetPath())
-        except Exception as exc:  # noqa: BLE001
-            carb.log_warn(f"Could not explicitly load {prim_path}: {exc}")
-        for _ in range(3):
-            sim_app.update()
-        _disable_asset_physics(asset_prim)
-        transform_op, scale_op = _reset_to_single_transform_op(asset_prim)
-        transform_op.Set(_make_transform_matrix(Gf.Vec3d(target_xy[0], target_xy[1], 0.0), rotation))
-        scale_op.Set(Gf.Vec3f(scale, scale, scale))
-        sim_app.update()
-        try:
-            bbox_cache = UsdGeom.BBoxCache(
-                Usd.TimeCode.Default(),
-                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
-            )
-            aligned_range = bbox_cache.ComputeWorldBound(asset_prim).ComputeAlignedRange()
-            center = aligned_range.GetMidpoint()
-            min_z = aligned_range.GetMin()[2]
-            max_z = aligned_range.GetMax()[2]
-            current_translation = Gf.Vec3d(target_xy[0], target_xy[1], 0.0)
-            translation = current_translation + Gf.Vec3d(target_xy[0] - center[0], target_xy[1] - center[1], 0.05 - min_z)
-            carb.log_info(
-                f"Grounded {prim_path}: center={center}, min_z={min_z:.4f}, max_z={max_z:.4f}, "
-                f"translation={translation}"
-            )
-        except Exception as exc:  # noqa: BLE001
-            carb.log_warn(f"Could not place {prim_path} on the ground from bbox: {exc}")
-            translation = Gf.Vec3d(target_xy[0], target_xy[1], 0.05)
-        transform_op.Set(_make_transform_matrix(translation, rotation))
-        scale_op.Set(Gf.Vec3f(scale, scale, scale))
-        grounded_asset_poses.append((transform_op, scale_op, translation, rotation, scale))
-
-    def _place_asset_on_ground(prim_path, target_xy, rotation, keep_locked: bool, scale=1.0) -> None:
-        asset_prim = stage.GetPrimAtPath(prim_path)
-        if not asset_prim.IsValid():
-            carb.log_warn(f"Cannot place missing asset prim: {prim_path}")
-            return
-        try:
-            stage.Load(asset_prim.GetPath(), Usd.LoadWithDescendants)
-        except TypeError:
-            stage.Load(asset_prim.GetPath())
-        except Exception as exc:  # noqa: BLE001
-            carb.log_warn(f"Could not explicitly load {prim_path}: {exc}")
-        for _ in range(3):
-            sim_app.update()
-        transform_op, scale_op = _reset_to_single_transform_op(asset_prim)
-        transform_op.Set(_make_transform_matrix(Gf.Vec3d(target_xy[0], target_xy[1], 0.0), rotation))
-        scale_op.Set(Gf.Vec3f(scale, scale, scale))
-        sim_app.update()
-        try:
-            bbox_cache = UsdGeom.BBoxCache(
-                Usd.TimeCode.Default(),
-                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
-            )
-            aligned_range = bbox_cache.ComputeWorldBound(asset_prim).ComputeAlignedRange()
-            center = aligned_range.GetMidpoint()
-            min_z = aligned_range.GetMin()[2]
-            translation = Gf.Vec3d(target_xy[0] - center[0] + target_xy[0], target_xy[1] - center[1] + target_xy[1], 0.05 - min_z)
-        except Exception as exc:  # noqa: BLE001
-            carb.log_warn(f"Could not place {prim_path} on the ground from bbox: {exc}")
-            translation = Gf.Vec3d(target_xy[0], target_xy[1], 0.05)
-        transform_op.Set(_make_transform_matrix(translation, rotation))
-        scale_op.Set(Gf.Vec3f(scale, scale, scale))
-        if keep_locked:
-            grounded_asset_poses.append((transform_op, scale_op, translation, rotation, scale))
-
-    def _make_existing_asset_display_only(prim_path) -> None:
-        asset_prim = stage.GetPrimAtPath(prim_path)
-        if not asset_prim.IsValid():
-            return
-        try:
-            stage.Load(asset_prim.GetPath(), Usd.LoadWithDescendants)
-        except TypeError:
-            stage.Load(asset_prim.GetPath())
-        except Exception as exc:  # noqa: BLE001
-            carb.log_warn(f"Could not explicitly load {prim_path}: {exc}")
-        for _ in range(3):
-            sim_app.update()
-        _disable_asset_physics(asset_prim)
-        carb.log_warn(f"{prim_path} set to display-only; PhysX articulation/rigid bodies disabled.")
 
     def _ensure_drone_prims() -> list[tuple[str, float]]:
         drone_specs = [
@@ -2888,6 +2818,147 @@ def main() -> None:
             carb.log_info(f"{robot_name} camera ready: {alias} -> {camera_path}")
 
     dispatcher = TeleopDispatcher([ranger_controller, r1pro_controller])
+    state_api = None
+    vr_switch_server = None
+    camera_image_captures = {}
+    last_camera_image_capture_time = 0.0
+    loop_frame_times_ms = deque(maxlen=120)
+    simulation_step_times_ms = deque(maxlen=120)
+
+    if args.enable_state_api:
+        try:
+            import omni.replicator.core as rep  # noqa: WPS433
+            from PIL import Image  # noqa: WPS433
+
+            image_resolution = (max(1, args.state_api_image_width), max(1, args.state_api_image_height))
+            for robot_name, aliases in robot_camera_aliases.items():
+                for alias, camera_path in aliases.items():
+                    render_product = rep.create.render_product(camera_path, image_resolution)
+                    annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+                    annotator.attach([render_product])
+                    camera_image_captures[(robot_name, alias)] = {"annotator": annotator, "image": Image}
+        except Exception as exc:  # noqa: BLE001
+            camera_image_captures.clear()
+            carb.log_warn(f"HTTP camera image capture is unavailable: {exc}")
+
+    def _state_api_robot_snapshot() -> dict[str, dict]:
+        """在 Isaac Sim 主线程生成可 JSON 序列化的状态快照。"""
+        robots = {}
+        for controller in (ranger_controller, r1pro_controller):
+            if controller is None or not getattr(controller, "available", False):
+                continue
+            feedback = controller.robot_feedback_snapshot()
+            robots[controller.name] = {
+                "kind": "ground_robot",
+                "prim_path": getattr(controller, "root_path", ""),
+                "position": [float(value) for value in feedback.get("position", [])],
+                "quat_wxyz": [float(value) for value in feedback.get("quat", [])],
+                "joints": {name: float(value) for name, value in feedback.get("joint_positions", {}).items()},
+                "joint_units": {
+                    name: {"position": units[0], "effort": units[1]}
+                    for name, units in feedback.get("joint_units", {}).items()
+                },
+            }
+        for state in drone_states_by_path.values():
+            translation = state.get("translation", (0.0, 0.0, 0.0))
+            robots[state["name"]] = {
+                "kind": "drone",
+                "prim_path": state["path"],
+                "position": [float(value) for value in translation],
+                "yaw_deg": float(state.get("yaw_deg", 0.0)),
+                "joints": {},
+                "joint_units": {},
+            }
+        return robots
+
+    def _state_api_relative_poses(robots: dict[str, dict]) -> dict[str, dict]:
+        """发布以 R1 Pro 车体坐标系表达的 Ranger Arm 位姿。"""
+        reference = robots.get("r1pro")
+        target = robots.get("ranger_arm")
+        if reference is None or target is None or "quat_wxyz" not in reference or "quat_wxyz" not in target:
+            return {}
+        ranger_in_r1pro_position, ranger_in_r1pro_quat = _relative_pose(
+            reference["position"], reference["quat_wxyz"], target["position"], target["quat_wxyz"]
+        )
+        r1pro_in_ranger_position, r1pro_in_ranger_quat = _relative_pose(
+            target["position"], target["quat_wxyz"], reference["position"], reference["quat_wxyz"]
+        )
+        return {
+            "r1pro/ranger_arm": {
+                "reference": "r1pro",
+                "target": "ranger_arm",
+                "position_m": [float(value) for value in ranger_in_r1pro_position],
+                "quat_wxyz": [float(value) for value in ranger_in_r1pro_quat],
+            },
+            "ranger_arm/r1pro": {
+                "reference": "ranger_arm",
+                "target": "r1pro",
+                "position_m": [float(value) for value in r1pro_in_ranger_position],
+                "quat_wxyz": [float(value) for value in r1pro_in_ranger_quat],
+            },
+        }
+
+    def _state_api_telemetry() -> dict[str, object]:
+        """汇总与 VR 遥操作响应相关的渲染、物理和输入时序。"""
+        frame_times = list(loop_frame_times_ms)
+        step_times = list(simulation_step_times_ms)
+        mean_frame_ms = sum(frame_times) / len(frame_times) if frame_times else 0.0
+        p95_frame_ms = sorted(frame_times)[int(0.95 * (len(frame_times) - 1))] if frame_times else 0.0
+        udp_age_ms = vr_switch_server.control_age_ms() if vr_switch_server is not None else None
+        return {
+            "sample_count": len(frame_times),
+            "target_control_hz": 1.0 / args.dt if args.dt > 0.0 else None,
+            "control_loop_paced": bool(args.pace_control_loop),
+            "loop_fps": 1000.0 / mean_frame_ms if mean_frame_ms > 0.0 else 0.0,
+            "loop_frame_ms_mean": mean_frame_ms,
+            "loop_frame_ms_p95": p95_frame_ms,
+            "simulation_step_ms_mean": sum(step_times) / len(step_times) if step_times else 0.0,
+            "simulation_step_ms_max": max(step_times) if step_times else 0.0,
+            "camera_image_target_fps": args.state_api_image_fps if camera_image_captures else 0.0,
+            "openxr_enabled": bool(args.enable_openxr_r1pro_vr and args.xr_openxr),
+            "openxr_calibrated": bool(openxr_vr_calibrated),
+            "udp_vr_control_age_ms": udp_age_ms,
+            "active_control_kind": active_control_context["kind"],
+            "active_robot": dispatcher.active_name if dispatcher is not None else None,
+        }
+
+    def _publish_state_api() -> None:
+        if state_api is None:
+            return
+        robots = _state_api_robot_snapshot()
+        state_api.publish(robots, robot_camera_aliases, _state_api_relative_poses(robots), _state_api_telemetry())
+
+    def _publish_camera_images() -> None:
+        nonlocal last_camera_image_capture_time
+        if state_api is None or not camera_image_captures:
+            return
+        now = time.time()
+        if now - last_camera_image_capture_time < 1.0 / max(args.state_api_image_fps, 0.1):
+            return
+        last_camera_image_capture_time = now
+        for (robot_name, alias), capture in camera_image_captures.items():
+            try:
+                rgb = np.asarray(capture["annotator"].get_data())
+                if rgb.ndim != 3 or rgb.shape[2] < 3:
+                    continue
+                output = io.BytesIO()
+                capture["image"].fromarray(rgb[:, :, :3].astype(np.uint8), mode="RGB").save(output, format="JPEG", quality=85)
+                state_api.publish_image(robot_name, alias, output.getvalue())
+            except Exception as exc:  # noqa: BLE001
+                carb.log_warn(f"Failed to capture {robot_name}.{alias} HTTP camera image: {exc}")
+
+    if args.enable_state_api:
+        try:
+            state_api = TeleopStateApiServer(args.state_api_host, args.state_api_port)
+            _publish_state_api()
+            state_api.start()
+            carb.log_info(
+                f"Teleop state API ready at http://{args.state_api_host}:{args.state_api_port}/api/v1 "
+                "(robots, joints, cameras, active-camera)."
+            )
+        except OSError as exc:
+            carb.log_warn(f"Unable to start teleop state API: {exc}")
+            state_api = None
     last_joint_position_log_time = 0.0
     last_feedback_window_update_time = 0.0
     feedback_label = None
@@ -3733,18 +3804,29 @@ def main() -> None:
         carb.log_info("Entering teleop loop.")
         last_heartbeat = time.time()
         last_selection_clear = 0.0
+        last_loop_started = time.perf_counter()
         while True:
+            loop_started = time.perf_counter()
+            loop_frame_times_ms.append((loop_started - last_loop_started) * 1000.0)
+            last_loop_started = loop_started
             _advance_stage_animation()
             asset_controller.apply_locked_poses()
             _apply_drone_trajectories()
+            simulation_step_started = time.perf_counter()
             if robot_articulation is not None or r1pro_articulation is not None:
                 my_world.step(render=True)
             else:
                 sim_app.update()
+            simulation_step_times_ms.append((time.perf_counter() - simulation_step_started) * 1000.0)
             _update_robot_camera_rigs()
             asset_controller.apply_locked_poses()
             _apply_drone_trajectories()
-            time.sleep(0.001)
+            _publish_state_api()
+            _publish_camera_images()
+            if args.pace_control_loop and args.dt > 0.0:
+                remaining_frame_time = args.dt - (time.perf_counter() - loop_started)
+                if remaining_frame_time > 0.0:
+                    time.sleep(remaining_frame_time)
 
             if args.clear_ui_selection and time.time() - last_selection_clear > 1.0:
                 _clear_stage_selection()
@@ -3778,6 +3860,11 @@ def main() -> None:
                     active_control_context["path"] = None
                     carb.log_warn(f"VR switch: control returned to robot teleop: {dispatcher.active_name}")
                 external_command = vr_switch_server.pop_command() if vr_switch_server is not None else None
+
+            state_api_command = state_api.pop_command() if state_api is not None else None
+            while state_api_command is not None:
+                _switch_named_camera(state_api_command["robot"], state_api_command["camera"])
+                state_api_command = state_api.pop_command() if state_api is not None else None
 
             if keyboard.consume_pressed(carb.input.KeyboardInput.F1):
                 _switch_to_overview_camera("Keyboard F1")
@@ -4202,6 +4289,8 @@ def main() -> None:
 
         carb.log_error(traceback.format_exc())
     finally:
+        if state_api is not None:
+            state_api.stop()
         if vr_switch_server is not None:
             vr_switch_server.stop()
         keyboard.disconnect()
