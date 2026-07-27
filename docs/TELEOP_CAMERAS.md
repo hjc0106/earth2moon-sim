@@ -28,6 +28,8 @@
 - `r1pro.head_top`
 - `r1pro.left_gripper`
 - `r1pro.right_gripper`
+
+相机别名、USD Camera 路径和外部切换方式也通过 [TELEOP_STATE_API.md](/home/zjz/workspace/tiangong/earth2moon-sim/docs/TELEOP_STATE_API.md) 提供。无人机 `cf2x`、`cf2x_01` 均提供 `chase` 视角，因此场景共有四个机器人可通过接口查询和切换视角。
 - `cf2x.chase`
 - `cf2x_01.chase`
 
