@@ -21,9 +21,14 @@ exec env SCENE_ENTRY="${SCRIPT_DIR}/keyboard_teleop_ranger_arm.py" \
     --openxr-vr-rotation-alpha 1.0 \
     --openxr-vr-max-position-speed 4.0 \
     --openxr-vr-max-rotation-speed 6.0 \
-    --openxr-vr-torso-speed 1.1 \
+    --openxr-vr-torso-speed 0.25 \
+    --openxr-vr-torso-yaw-speed 0.12 \
+    --openxr-vr-torso-yaw-limit-deg 60.0 \
     --openxr-vr-base-speed 1.0 \
     --openxr-vr-base-yaw-speed 1.25 \
+    --dt 0.03333333333333333 \
+    --state-api-fps 15 \
+    --state-api-image-fps 5 \
     --add-r1pro \
     --r1pro-physics \
     --r1pro-x 1.8 \

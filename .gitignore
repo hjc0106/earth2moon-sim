@@ -1,5 +1,7 @@
 __pycache__/
 *.py[cod]
 .isaaclab_site/
+.tools/
+.venv/
 *.blend1
 assets/tiangong_scene.zip

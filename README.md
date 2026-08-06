@@ -17,6 +17,25 @@
 
 `scripts/run_with_isaaclab.sh` 会自动把 `source/tiangong` 加入 `PYTHONPATH`，并设置 `TIANGONG_PROJECT_ASSETS_ROOT` 指向项目内 `assets/`。请始终通过该脚本启动，避免 USD 场景路径解析错误。
 
+### 新服务器最小部署（Isaac Sim 5.1）
+
+需要 Ubuntu 22.04+、NVIDIA 驱动及 Python 3.11。项目使用仓库内的 `.venv`，不修改系统 Python。准备好项目内 `.tools/bin/uv` 后执行：
+
+```bash
+git lfs pull origin main
+./scripts/install_minimal.sh
+```
+
+仓库中的 USD/DAE 大文件由 Git LFS 管理；如果未执行 `git lfs pull`，脚本会在安装前报错，避免到启动时才发现场景缺失。
+
+无窗口最小启动（加载 Ranger Arm 和 R1 Pro，不启动 CloudXR，不依赖旧服务器路径）：
+
+```bash
+./scripts/run_minimal.sh
+```
+
+如需本机图形窗口，使用下面的“启动遥操作”命令。`run_with_isaaclab.sh` 会自动优先使用 `.venv/bin/python`。
+
 ### 方式 A：pip 安装（推荐）
 
 在 conda/venv 中安装 `isaacsim`、`isaacsim-rl` 等包后，**没有** `python.sh`，需把 `ISAAC_SIM_PYTHON` 指向当前环境的 `python`：
@@ -94,9 +113,9 @@ R1 Pro 默认只从 `assets/r1pro/r1pro.usda` 加载。Ranger Arm 和天宫场�
 - `A/D` 或 `←/→`：Ranger Arm 转向；R1 Pro 横移/方向控制按当前控制器逻辑执行。
 - `Q/E`：R1 Pro 底盘转向；Ranger Arm 普通模式下用于升降。
 - `TAB`：切换左臂、右臂、双臂目标。
-- `I/K`、`J/L`、`U/O`：移动当前机械臂目标。
-- `T/G`、`F/H`、`R/Y`：旋转当前机械臂目标。
-- `3/4`：R1 Pro 末端第 7 轴。
+- `I/K`、`J/L`、`U/O`：当前机械臂第 1、2、3 关节。
+- `T/G`、`F/H`、`R/Y`：当前机械臂第 4、5、6 关节。
+- `7/8`：当前机械臂第 7 关节。
 - `5/6`：R1 Pro 躯干 yaw。
 - `M/N`：夹爪开/合。
 - `ESC`：退出。

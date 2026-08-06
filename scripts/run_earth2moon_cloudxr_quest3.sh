@@ -5,14 +5,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CLOUDXR_LAUNCHER="${CLOUDXR_LAUNCHER:-/home/zjz/workspace/tiangong/mujoco_teleop/scripts/run_isaacteleop_cloudxr_quest3.sh}"
+CLOUDXR_LAUNCHER="${CLOUDXR_LAUNCHER:-${SCRIPT_DIR}/run_isaacteleop_cloudxr_quest3.sh}"
 SCENE_LAUNCHER="${SCENE_LAUNCHER:-${SCRIPT_DIR}/run_with_isaaclab.sh}"
 SCENE_ENTRY="${SCENE_ENTRY:-${SCRIPT_DIR}/keyboard_teleop_ranger_arm.py}"
 
-HOST_IP="${HOST_IP:-172.18.4.85}"
+DETECTED_HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+HOST_IP="${HOST_IP:-${DETECTED_HOST_IP:-127.0.0.1}}"
 PROXY_PORT="${PROXY_PORT:-48322}"
-CLOUDXR_ENV_FILE="${CLOUDXR_ENV_FILE:-/home/zjz/.cloudxr/run/cloudxr.env}"
-STARTUP_WAIT_SEC="${STARTUP_WAIT_SEC:-20}"
+CLOUDXR_RUN_DIR="${CLOUDXR_RUN_DIR:-${HOME}/.cloudxr/run}"
+CLOUDXR_ENV_FILE="${CLOUDXR_ENV_FILE:-${CLOUDXR_RUN_DIR}/cloudxr.env}"
+STARTUP_WAIT_SEC="${STARTUP_WAIT_SEC:-60}"
 HEADSET_CLIENT_BASE="${HEADSET_CLIENT_BASE:-https://nvidia.github.io/IsaacTeleop/client/}"
 HEADSET_CODEC="${HEADSET_CODEC:-h264}"
 HEADSET_IMMERSIVE_MODE="${HEADSET_IMMERSIVE_MODE:-vr}"
@@ -43,7 +45,12 @@ cleanup() {
     fi
 }
 
-trap cleanup EXIT INT TERM
+handle_signal() {
+    exit 130
+}
+
+trap cleanup EXIT
+trap handle_signal INT TERM
 
 echo "[quest3] starting official IsaacTeleop CloudXR flow for earth2moon-sim..."
 echo "[quest3] certificate URL: https://${HOST_IP}:${PROXY_PORT}/"
@@ -55,7 +62,9 @@ CLOUDXR_PID=$!
 
 deadline=$((SECONDS + STARTUP_WAIT_SEC))
 while (( SECONDS < deadline )); do
-    if [[ -f "${CLOUDXR_ENV_FILE}" ]] && grep -q "XR_RUNTIME_JSON" "${CLOUDXR_ENV_FILE}"; then
+    if [[ -f "${CLOUDXR_ENV_FILE}" ]] \
+        && grep -q "XR_RUNTIME_JSON" "${CLOUDXR_ENV_FILE}" \
+        && (echo >/dev/tcp/127.0.0.1/"${PROXY_PORT}") >/dev/null 2>&1; then
         break
     fi
     if ! kill -0 "${CLOUDXR_PID}" >/dev/null 2>&1; then
@@ -66,8 +75,10 @@ while (( SECONDS < deadline )); do
     sleep 1
 done
 
-if [[ ! -f "${CLOUDXR_ENV_FILE}" ]]; then
-    echo "[ERROR] CloudXR env file not ready: ${CLOUDXR_ENV_FILE}" >&2
+if [[ ! -f "${CLOUDXR_ENV_FILE}" ]] \
+    || ! (echo >/dev/tcp/127.0.0.1/"${PROXY_PORT}") >/dev/null 2>&1; then
+    echo "[ERROR] CloudXR service was not ready after ${STARTUP_WAIT_SEC}s." >&2
+    echo "Expected environment file: ${CLOUDXR_ENV_FILE}" >&2
     echo "Check CloudXR log: ${CLOUDXR_LOG_FILE}" >&2
     exit 1
 fi
@@ -119,4 +130,20 @@ echo "[quest3] opening earth2moon-sim scene in XR OpenXR experience..."
 echo "[quest3] CloudXR log: ${CLOUDXR_LOG_FILE}"
 echo "[quest3] project root: ${PROJECT_ROOT}"
 
-exec "${SCENE_LAUNCHER}" "${SCENE_ENTRY}" --xr-openxr "$@"
+set +e
+"${SCENE_LAUNCHER}" "${SCENE_ENTRY}" --xr-openxr "$@"
+scene_status=$?
+set -e
+
+# Kit/OpenXR can terminate with SIGSEGV once while populating its extension
+# cache on a fresh machine. Keep CloudXR alive and retry the scene exactly once.
+if [[ ${scene_status} -eq 139 ]]; then
+    echo "[quest3] Isaac Sim/OpenXR exited with status 139; retrying once after cache initialization..." >&2
+    sleep 2
+    set +e
+    "${SCENE_LAUNCHER}" "${SCENE_ENTRY}" --xr-openxr "$@"
+    scene_status=$?
+    set -e
+fi
+
+exit "${scene_status}"

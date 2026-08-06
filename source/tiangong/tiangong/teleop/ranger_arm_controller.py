@@ -116,6 +116,18 @@ class RangerArmTeleopController:
             feedback["joint_efforts"] = {
                 str(name): float(efforts[index]) for index, name in enumerate(names[: efforts.size])
             }
+            for side in ("left", "right"):
+                finger_names = [f"gripper_{side}_joint", f"gripper_{side}_joint_mimic"]
+                finger_efforts = [
+                    abs(feedback["joint_efforts"][name])
+                    for name in finger_names
+                    if name in feedback["joint_efforts"]
+                ]
+                feedback.setdefault("gripper_force", {})[side] = {
+                    "effort": max(finger_efforts, default=0.0),
+                    "unit": "N*m",
+                    "source": "measured_joint_effort",
+                }
         except Exception:
             pass
         return feedback

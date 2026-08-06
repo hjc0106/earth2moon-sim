@@ -11,12 +11,18 @@ LOCAL_NATIVE_LIB_DIRS=()
 LOCAL_SOURCE_ROOT="${PROJECT_ROOT}/source/tiangong"
 LOCAL_ASSET_ROOT="${TIANGONG_LOCAL_ASSET_ROOT:-${PROJECT_ROOT}/assets}"
 
+# Isaac Sim pip packages require non-interactive deployments to acknowledge the
+# NVIDIA Omniverse EULA explicitly. Users can override this before launching.
+export OMNI_KIT_ACCEPT_EULA="${OMNI_KIT_ACCEPT_EULA:-YES}"
+
 export TIANGONG_ASSET_ROOT="${LOCAL_ASSET_ROOT}"
 export TIANGONG_PROJECT_ASSETS_ROOT="${PROJECT_ROOT}/assets"
 export TIANGONG_ISAAC_ASSET_ROOT="${TIANGONG_ISAAC_ASSET_ROOT:-${LOCAL_ASSET_ROOT}}"
 
 if [[ -n "${ISAAC_SIM_PYTHON:-}" ]]; then
     PYTHON_CMD="${ISAAC_SIM_PYTHON}"
+elif [[ -x "${PROJECT_ROOT}/.venv/bin/python" ]]; then
+    PYTHON_CMD="${PROJECT_ROOT}/.venv/bin/python"
 elif [[ -x "${PROJECT_ROOT}/../../IsaacSim/python.sh" ]]; then
     PYTHON_CMD="${PROJECT_ROOT}/../../IsaacSim/python.sh"
 elif [[ -x "${PROJECT_ROOT}/../IsaacSim/python.sh" ]]; then
