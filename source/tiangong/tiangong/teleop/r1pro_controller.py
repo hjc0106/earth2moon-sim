@@ -146,6 +146,18 @@ class R1ProTeleopController:
             feedback["joint_efforts"] = {
                 str(name): float(efforts[index]) for index, name in enumerate(names[: efforts.size])
             }
+            for side in ("left", "right"):
+                finger_names = [f"{side}_gripper_finger_joint1", f"{side}_gripper_finger_joint2"]
+                finger_efforts = [
+                    abs(feedback["joint_efforts"][name])
+                    for name in finger_names
+                    if name in feedback["joint_efforts"]
+                ]
+                feedback.setdefault("gripper_force", {})[side] = {
+                    "effort": max(finger_efforts, default=0.0),
+                    "unit": "N*m",
+                    "source": "measured_joint_effort",
+                }
         except Exception:
             pass
         return feedback
@@ -252,12 +264,12 @@ class R1ProTeleopController:
         try:
             if self.torso_indices.size:
                 self.articulation._articulation_view.set_gains(
-                    kps=np.full((1, self.torso_indices.size), 15000.0, dtype=np.float32),
-                    kds=np.full((1, self.torso_indices.size), 1500.0, dtype=np.float32),
+                    kps=np.full((1, self.torso_indices.size), 6000.0, dtype=np.float32),
+                    kds=np.full((1, self.torso_indices.size), 600.0, dtype=np.float32),
                     joint_indices=self.torso_indices,
                 )
                 self.articulation._articulation_view.set_max_efforts(
-                    values=np.full((1, self.torso_indices.size), 3000.0, dtype=np.float32),
+                    values=np.full((1, self.torso_indices.size), 1200.0, dtype=np.float32),
                     joint_indices=self.torso_indices,
                 )
             if self.base_indices.size:
@@ -516,18 +528,18 @@ class R1ProTeleopController:
         self._ik_debug_counter += 1
 
     def _update_direct_arm_joint_targets(self, tasks, delta_xyz, delta_rot, joint7_delta=0.0) -> bool:
-        """把键盘末端增量映射为直接关节增量，当前用于更稳定的 R1 Pro 手臂控制。"""
+        """把统一输入通道按顺序映射到 7 个机械臂关节的直接增量。"""
         joint_delta = np.zeros(7, dtype=np.float32)
         if delta_xyz is not None and np.any(delta_xyz):
             delta_xyz = np.asarray(delta_xyz, dtype=np.float32)
-            joint_delta[1] += float(delta_xyz[0]) * 8.0
-            joint_delta[0] += float(delta_xyz[1]) * 8.0
+            joint_delta[0] += float(delta_xyz[0]) * 8.0
+            joint_delta[1] += float(delta_xyz[1]) * 8.0
             joint_delta[2] += float(delta_xyz[2]) * 8.0
         if delta_rot is not None and np.any(delta_rot):
             delta_rot = np.asarray(delta_rot, dtype=np.float32)
-            joint_delta[6] += float(delta_rot[0]) * 2.0
-            joint_delta[5] += float(delta_rot[1]) * 2.0
-            joint_delta[4] += float(delta_rot[2]) * 2.0
+            joint_delta[3] += float(delta_rot[0]) * 2.0
+            joint_delta[4] += float(delta_rot[1]) * 2.0
+            joint_delta[5] += float(delta_rot[2]) * 2.0
         if joint7_delta != 0.0:
             joint_delta[6] += float(joint7_delta) * 2.0
         if not np.any(joint_delta):

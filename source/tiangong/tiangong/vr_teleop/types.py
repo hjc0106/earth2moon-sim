@@ -21,6 +21,7 @@ class VRControllerState:
     squeeze: float = 0.0
     thumbstick_x: float = 0.0
     thumbstick_y: float = 0.0
+    thumbstick_click: float = 0.0
     button_0: float = 0.0
     button_1: float = 0.0
 

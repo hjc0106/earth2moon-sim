@@ -89,14 +89,14 @@ Ranger 底盘只使用左手柄摇杆：上下为前进/后退，左右为左转
 推荐直接用：
 
 ```bash
-cd /home/zjz/workspace/tiangong/earth2moon-sim
+cd <EARTH2MOON_PROJECT_ROOT>
 ./scripts/run_scene_r1pro_vr_quest3.sh
 ```
 
 等价命令：
 
 ```bash
-cd /home/zjz/workspace/tiangong/earth2moon-sim
+cd <EARTH2MOON_PROJECT_ROOT>
 
 bash scripts/run_with_isaaclab.sh scripts/keyboard_teleop_ranger_arm.py \
   --xr-openxr \

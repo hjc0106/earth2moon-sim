@@ -1,4 +1,4 @@
-# Quest3 CloudXR 手动启动
+# Quest3 CloudXR 一体化启动
 
 本文档记录 `earth2moon-sim` 场景接入 Quest3 的手动启动顺序和对应命令。
 
@@ -7,12 +7,15 @@
 - 建议在非 conda 终端里启动 `Isaac Sim` 相关脚本。
 - 当前如果直接在 `conda` 终端里执行 `run_with_isaaclab.sh`，可能会在进入脚本前就报环境问题。
 
-当前机器上的关键地址：
+部署参数（不要写死为某台服务器的实际值）：
 
-- Host IP: `172.18.4.85`
-- CloudXR WSS 端口: `48322`
-- CloudXR backend 端口: `49100`
-- Quest3 访问地址: `https://172.18.4.85:48322/client/`
+- 项目目录：脚本根据自身位置计算，不依赖固定用户目录。
+- 部署服务器地址：默认从本机网卡自动检测；多网卡时用 `HOST_IP=<QUEST3可访问地址>` 覆盖。
+- CloudXR WSS 端口：当前 Isaac Teleop Runtime 使用默认 `48322`。
+- CloudXR backend：默认 `49100`，仅供服务器本机 WSS 代理访问。
+- CloudXR 数据目录：默认 `${HOME}/.cloudxr`，可用 `CLOUDXR_INSTALL_DIR` 覆盖。
+- 运行环境文件：`${CLOUDXR_INSTALL_DIR:-${HOME}/.cloudxr}/run/cloudxr.env`。
+- 证书地址和 Quest3 WebXR 客户端完整网址由一键脚本按实际部署地址输出，不应复制固定 IP。
 
 ## 启动顺序
 
@@ -21,14 +24,24 @@
 1. 启动 CloudXR 服务
 2. 启动 `earth2moon-sim` XR 场景
 3. 在 Isaac Sim 里确认 XR/VR 已启用
-4. 在 Quest3 上连接 `172.18.4.85:48322`
+4. 在 Quest3 上打开启动日志打印的证书地址和 WebXR 客户端网址
 
 ## 方式一：推荐，一条命令起场景
 
 这个方式最简单。脚本会先拉起 CloudXR，再启动 `earth2moon-sim` 的 XR 场景。
 
 ```bash
-cd /home/zjz/workspace/tiangong/earth2moon-sim
+cd <EARTH2MOON_PROJECT_ROOT>
+./scripts/run_scene_r1pro_vr_quest3.sh
+```
+
+一键入口默认采用同步优先配置：物理、控制和 Isaac Sim 渲染统一为 `30 Hz`，机器人状态反馈最高 `15 Hz`，HTTP 相机缓存最高 `5 Hz`。需要覆盖时可在命令末尾追加新的 `--dt`、`--state-api-fps` 或 `--state-api-image-fps`；后出现的参数生效。
+
+多网卡或反向代理部署示例：
+
+```bash
+HOST_IP=<QUEST3可访问的部署服务器地址> \
+CLOUDXR_INSTALL_DIR=<部署服务器上的CloudXR数据目录> \
 ./scripts/run_scene_r1pro_vr_quest3.sh
 ```
 
@@ -39,11 +52,8 @@ cd /home/zjz/workspace/tiangong/earth2moon-sim
 ### 终端 1：启动 CloudXR
 
 ```bash
-cd /home/zjz/workspace/IsaacTeleop
-
-source .venv/bin/activate
-
-/home/zjz/workspace/tiangong/mujoco_teleop/scripts/run_isaacteleop_cloudxr_quest3.sh
+cd <EARTH2MOON_PROJECT_ROOT>
+./scripts/run_isaacteleop_cloudxr_quest3.sh
 ```
 
 正常情况下会看到类似输出：
@@ -51,7 +61,7 @@ source .venv/bin/activate
 ```text
 CloudXR runtime: running
 CloudXR WSS proxy: running
-Activate CloudXR environment in another terminal: source /home/zjz/.cloudxr/run/cloudxr.env
+Activate CloudXR environment in another terminal: source <CLOUDXR_INSTALL_DIR>/run/cloudxr.env
 ```
 
 这个终端不要关。
@@ -59,9 +69,9 @@ Activate CloudXR environment in another terminal: source /home/zjz/.cloudxr/run/
 ### 终端 2：启动 earth2moon-sim XR 场景
 
 ```bash
-source /home/zjz/.cloudxr/run/cloudxr.env
+source "${CLOUDXR_INSTALL_DIR:-${HOME}/.cloudxr}/run/cloudxr.env"
 
-cd /home/zjz/workspace/tiangong/earth2moon-sim
+cd <EARTH2MOON_PROJECT_ROOT>
 
 bash scripts/run_with_isaaclab.sh scripts/keyboard_teleop_ranger_arm.py \
   --xr-openxr \
@@ -77,9 +87,9 @@ bash scripts/run_with_isaaclab.sh scripts/keyboard_teleop_ranger_arm.py \
 如果你想加低速参数，建议用这个版本：
 
 ```bash
-source /home/zjz/.cloudxr/run/cloudxr.env
+source "${CLOUDXR_INSTALL_DIR:-${HOME}/.cloudxr}/run/cloudxr.env"
 
-cd /home/zjz/workspace/tiangong/earth2moon-sim
+cd <EARTH2MOON_PROJECT_ROOT>
 
 bash scripts/run_with_isaaclab.sh scripts/keyboard_teleop_ranger_arm.py \
   --xr-openxr \
@@ -100,9 +110,9 @@ bash scripts/run_with_isaaclab.sh scripts/keyboard_teleop_ranger_arm.py \
 当上面两个终端都正常后：
 
 1. 打开 Quest3 里的 CloudXR/Isaac Teleop client
-2. 访问 `https://172.18.4.85:48322/client/`
-3. 如果需要，也可以直接填服务地址 `172.18.4.85` 和端口 `48322`
-4. 连接后，再看 Isaac Sim 里是否需要点 `Start VR`
+2. 首次先访问 `https://<SERVER_IP>:48322/` 并接受自签名证书
+3. 再打开脚本打印的 NVIDIA Isaac Teleop WebXR 客户端网址
+4. 如果使用原生客户端，也可直接填服务地址 `<SERVER_IP>` 和端口 `48322`
 
 ## 场景里的相机切换
 

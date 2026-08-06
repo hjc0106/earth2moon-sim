@@ -16,6 +16,7 @@
 | `--state-api-image-width` | `integer` | `640` | 单张相机图像宽度（像素）。 |
 | `--state-api-image-height` | `integer` | `480` | 单张相机图像高度（像素）。 |
 | `--state-api-image-fps` | `number` | `10.0` | 图像缓存最大刷新频率，不是视频流帧率保证。 |
+| `--state-api-fps` | `number` | `20.0` | 机器人状态和控制反馈的最大发布频率。 |
 | `--pace-control-loop` / `--no-pace-control-loop` | `bool` | `true` | 以 `--dt` 节拍限制遥操作循环，防止固定步长的 VR/键盘增量在过高 FPS 下被重复叠加。 |
 
 其他使用方应先请求 `GET /cameras` 获取当前场景真实存在的机器人名与相机别名；不要硬编码 USD Camera 路径。机器人可用名称通常是 `ranger_arm`、`r1pro`、`cf2x`、`cf2x_01`。
@@ -216,7 +217,10 @@ GET /api/v1/relative-poses/r1pro/ranger_arm
 | `loop_frame_ms_mean` / `loop_frame_ms_p95` | `number` | 主循环平均帧耗时及 P95 帧耗时；P95 明显偏大表示存在抖动。 |
 | `simulation_step_ms_mean` / `simulation_step_ms_max` | `number` | physics + render 的平均/最大单步耗时。 |
 | `camera_image_target_fps` | `number` | HTTP 图像缓存配置的最高刷新率；0 表示相机图像采集未启用。 |
+| `state_feedback_target_fps` | `number` | 机器人状态反馈配置的最高发布频率；0 表示状态服务未启用。 |
 | `openxr_enabled` / `openxr_calibrated` | `boolean` | OpenXR VR 是否启用、是否已完成标定。 |
+
+地面机器人状态中的 `gripper_force.left/right` 提供夹爪模拟力度反馈。`effort` 当前来自夹爪关节的 `measured_joint_effort`，单位为 `N*m`，用于仿真触觉强度与调试；它不是末端实体六维力传感器的牛顿读数。
 | `udp_vr_control_age_ms` | `number \| null` | 最近一次外部 UDP VR 控制包的年龄；`null` 表示未收到过控制包。持续大于约 300 ms 时该控制输入已按过期处理。 |
 | `active_control_kind` / `active_robot` | `string \| null` | 当前控制上下文及当前机器人。 |
 

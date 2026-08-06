@@ -6,6 +6,7 @@
 
 import argparse
 import csv
+import importlib.util
 import io
 import json
 import math
@@ -201,11 +202,14 @@ def _query_openxr_controller(input_device):
     squeeze = 0.0
     button_0 = 0.0
     button_1 = 0.0
+    thumbstick_click = 0.0
 
     if input_device.has_input_gesture("thumbstick", "x"):
         thumbstick_x = float(input_device.get_input_gesture_value("thumbstick", "x"))
     if input_device.has_input_gesture("thumbstick", "y"):
         thumbstick_y = float(input_device.get_input_gesture_value("thumbstick", "y"))
+    if input_device.has_input_gesture("thumbstick", "click"):
+        thumbstick_click = float(input_device.get_input_gesture_value("thumbstick", "click"))
     if input_device.has_input_gesture("trigger", "value"):
         trigger = float(input_device.get_input_gesture_value("trigger", "value"))
     if input_device.has_input_gesture("squeeze", "value"):
@@ -231,7 +235,7 @@ def _query_openxr_controller(input_device):
         float(quat.GetImaginary()[1]),
         float(quat.GetImaginary()[2]),
     ]
-    input_row = [thumbstick_x, thumbstick_y, trigger, squeeze, button_0, button_1, 0.0]
+    input_row = [thumbstick_x, thumbstick_y, trigger, squeeze, button_0, button_1, thumbstick_click]
     return np.array([pose_row, input_row], dtype=np.float32)
 
 
@@ -260,14 +264,24 @@ def default_drone_trajectory_paths() -> tuple[str, str]:
 
 
 def default_xr_openxr_experience_path() -> str:
-    """返回 Isaac Sim XR OpenXR experience 路径。"""
+    """返回适合 CloudXR 头显沉浸视角的 Isaac Sim XR VR experience。"""
     exp_path = os.environ.get("EXP_PATH", "").strip()
     if exp_path:
-        candidate = Path(exp_path) / "isaacsim.exp.base.xr.openxr.kit"
+        candidate = Path(exp_path) / "isaacsim.exp.base.xr.vr.kit"
         if candidate.exists():
             return str(candidate)
+
+    # pip/venv installation: <site-packages>/isaacsim/apps/*.kit
+    isaacsim_spec = importlib.util.find_spec("isaacsim")
+    if isaacsim_spec is not None:
+        for package_path in isaacsim_spec.submodule_search_locations or ():
+            candidate = Path(package_path) / "apps" / "isaacsim.exp.base.xr.vr.kit"
+            if candidate.exists():
+                return str(candidate)
+
+    # Standalone installation kept next to the workspace.
     repo_root = Path(__file__).resolve().parents[3]
-    candidate = repo_root / "IsaacSim" / "apps" / "isaacsim.exp.base.xr.openxr.kit"
+    candidate = repo_root / "IsaacSim" / "apps" / "isaacsim.exp.base.xr.vr.kit"
     return str(candidate)
 
 
@@ -821,9 +835,22 @@ def main() -> None:
     )
     parser.add_argument("--state-api-host", type=str, default="127.0.0.1", help="HTTP API bind host.")
     parser.add_argument("--state-api-port", type=int, default=8211, help="HTTP API bind port.")
+    parser.add_argument("--state-api-fps", type=float, default=20.0, help="Maximum robot-state feedback publish rate.")
     parser.add_argument("--state-api-image-width", type=int, default=640, help="HTTP camera image width in pixels.")
     parser.add_argument("--state-api-image-height", type=int, default=480, help="HTTP camera image height in pixels.")
     parser.add_argument("--state-api-image-fps", type=float, default=10.0, help="Maximum HTTP camera image refresh rate.")
+    parser.add_argument(
+        "--openxr-gripper-haptics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Map simulated gripper joint effort to Quest controller vibration.",
+    )
+    parser.add_argument(
+        "--openxr-haptic-full-scale-effort",
+        type=float,
+        default=10.0,
+        help="Gripper joint effort in N*m that maps to full controller vibration.",
+    )
     parser.add_argument(
         "--wrap-prim",
         action="store_true",
@@ -1098,8 +1125,8 @@ def main() -> None:
     parser.add_argument(
         "--add-r1pro",
         action="store_true",
-        default=False,
-        help="Add the project-local Galaxea R1 Pro USD to the scene.",
+        default=True,
+        help="Add the project-local Galaxea R1 Pro USD to the scene (enabled by default).",
     )
     parser.add_argument(
         "--no-add-r1pro",
@@ -1354,6 +1381,18 @@ def main() -> None:
         help="Quest3 手柄按键控制 r1pro 腰部前两个关节时的速度系数。",
     )
     parser.add_argument(
+        "--openxr-vr-torso-yaw-speed",
+        type=float,
+        default=0.12,
+        help="Continuous R1Pro torso_joint4 yaw speed while a Quest thumbstick is pressed.",
+    )
+    parser.add_argument(
+        "--openxr-vr-torso-yaw-limit-deg",
+        type=float,
+        default=60.0,
+        help="Symmetric safety limit for Quest-controlled R1Pro torso_joint4 yaw.",
+    )
+    parser.add_argument(
         "--openxr-vr-base-speed",
         type=float,
         default=1.0,
@@ -1442,9 +1481,7 @@ def main() -> None:
 
     if args.xr_openxr:
         settings = carb.settings.get_settings()
-        settings.set_float("/persistent/xr/profile/ar/render/nearPlane", 0.15)
-        settings.set_string("/persistent/xr/profile/ar/anchorMode", "custom anchor")
-        settings.set_string("/xrstage/profile/ar/customAnchor", "/World/XRAnchor")
+        settings.set_float("/persistent/xr/profile/vr/render/nearPlane", 0.15)
 
     if getattr(args, "deprecated_move_prim", False):
         carb.log_warn("--move-prim is deprecated and ignored; base motion now requires wheel/steer DOFs.")
@@ -1529,7 +1566,14 @@ def main() -> None:
             position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
             orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
         )
-    my_world = World(stage_units_in_meters=1.0, backend="numpy")
+    # Keep physics, rendering and fixed-dt input increments on one clock.  This
+    # prevents lowering the control rate from making the simulated motion slow.
+    my_world = World(
+        stage_units_in_meters=1.0,
+        physics_dt=float(args.dt),
+        rendering_dt=float(args.dt),
+        backend="numpy",
+    )
     asset_controller = DroneAssetController(
         stage,
         sim_app,
@@ -1998,25 +2042,29 @@ def main() -> None:
         }
         return camera_prim_path
 
-    def _build_r1pro_camera_aliases(scene_prim_path: str) -> dict[str, str]:
-        embedded_camera_candidates = [
-            f"{scene_prim_path}/Root/r1_pro_with_gripper/zed_link/teleop_head_top/Camera",
-            f"{scene_prim_path}/r1_pro_with_gripper/zed_link/teleop_head_top/Camera",
-        ]
-        for camera_path in embedded_camera_candidates:
-            camera_prim = stage.GetPrimAtPath(camera_path)
-            if not camera_prim.IsValid():
-                continue
-            camera_xform = camera_prim.GetParent()
-            rotate_attr = camera_xform.GetAttribute("xformOp:rotateXYZ")
-            if rotate_attr.IsValid():
-                # USD Camera 沿局部 -Z 观察；该资产的 180 度局部偏航对准机体前方。
-                rotate_attr.Set(Gf.Vec3f(0.0, 180.0, 0.0))
-            return {"head_top": camera_path}
+    def _forward_down_camera_quat(pitch_down_deg: float) -> Gf.Quatf:
+        """Return an upright camera pose looking along body +X and slightly down."""
+        # USD Camera looks along local -Z and uses local +Y as image up.
+        forward_rotation = Gf.Rotation(Gf.Quatf(0.5, Gf.Vec3f(0.5, -0.5, -0.5)))
+        downward_tilt = Gf.Rotation(Gf.Vec3d(1.0, 0.0, 0.0), -abs(float(pitch_down_deg)))
+        camera_quat = (forward_rotation * downward_tilt).GetQuat()
+        return Gf.Quatf(
+            float(camera_quat.GetReal()),
+            Gf.Vec3f(
+                float(camera_quat.GetImaginary()[0]),
+                float(camera_quat.GetImaginary()[1]),
+                float(camera_quat.GetImaginary()[2]),
+            ),
+        )
 
+    def _build_r1pro_camera_aliases(scene_prim_path: str) -> dict[str, str]:
+        # Do not inherit the embedded zed_link camera orientation: that link's
+        # imported coordinate frame is rotated relative to the mobile base and
+        # can make the image point at the floor or appear upside-down.
+        # Follow torso_link4 so the head view also follows the 5/6 waist yaw.
         head_candidates = [
-            ("/Root/r1_pro_with_gripper/zed_link", (0.02, 0.0, 0.08), (0.0, 180.0, 0.0), 18.0),
-            ("/r1_pro_with_gripper/zed_link", (0.02, 0.0, 0.08), (0.0, 180.0, 0.0), 18.0),
+            ("/Root/r1_pro_with_gripper/torso_link4", (0.14, 0.0, 0.54), (0.0, 0.0, 0.0), 18.0),
+            ("/r1_pro_with_gripper/torso_link4", (0.14, 0.0, 0.54), (0.0, 0.0, 0.0), 18.0),
         ]
         aliases = {}
         for suffix, translate, rotate_xyz, focal_length in head_candidates:
@@ -2030,16 +2078,19 @@ def main() -> None:
                 focal_length,
             )
             if camera_path is not None and stage.GetPrimAtPath(camera_path).IsValid():
+                rig = robot_camera_rigs.get(("r1pro", "head_top"))
+                if rig is not None:
+                    rig["base_local_rotation"] = _forward_down_camera_quat(15.0)
                 aliases["head_top"] = camera_path
                 break
         return aliases
 
     def _build_ranger_camera_aliases(scene_prim_path: str) -> dict[str, str]:
         head_candidates = [
+            ("/base_footprint", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
+            ("/base_link", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
             ("/chassis_link", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
             ("/body", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
-            ("/base_link", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
-            ("/base_footprint", (0.22, 0.0, 2.02), (22.0, 0.0, 0.0), 15.0),
         ]
         link_candidates = {
             "head_top": head_candidates,
@@ -2059,11 +2110,7 @@ def main() -> None:
                 if camera_path is not None and stage.GetPrimAtPath(camera_path).IsValid():
                     rig = robot_camera_rigs.get(("ranger_arm", alias))
                     if rig is not None and alias == "head_top":
-                        # Ranger 的车体正面是 +X；USD Camera 沿局部 -Z 观察。
-                        rig["base_local_rotation"] = Gf.Quatf(
-                            0.5,
-                            Gf.Vec3f(0.5, -0.5, -0.5),
-                        )
+                        rig["base_local_rotation"] = _forward_down_camera_quat(15.0)
                     aliases[alias] = camera_path
                     break
         return aliases
@@ -2760,6 +2807,8 @@ def main() -> None:
     openxr_vr_calibration_task_pose = {}
     openxr_head_limit_reference = {}
     openxr_head_device_alignment = {}
+    openxr_haptic_outputs = {}
+    openxr_haptic_warned = set()
 
     if args.enable_openxr_r1pro_vr:
         if not args.xr_openxr:
@@ -2780,6 +2829,10 @@ def main() -> None:
                 if openxr_xr_core is None:
                     carb.log_warn("XRCore singleton unavailable; OpenXR r1pro VR control disabled.")
                 else:
+                    # Oculus Touch maps xr_menu to the left Y button. Y is part
+                    # of this application's Y+B calibration chord, so remove
+                    # the stock XR menu binding while keeping desktop Start VR.
+                    openxr_xr_core.unbind_input_event_generator("xr_menu")
                     openxr_vr_bridge = VRBimanualBridge()
                     openxr_vr_bridge.mapper.cfg.position_scale = args.openxr_vr_position_scale
                     adapter_config = R1ProVRAdapterConfig(
@@ -2801,7 +2854,7 @@ def main() -> None:
                         f"OpenXR robot VR control ready: {list(openxr_vr_adapters)}. "
                         "F3 选择 ranger_arm，F4 选择 r1pro；切换后把双手柄摆到期望起始姿态，"
                         "再同时按住左手柄 Y 和右手柄 B 完成当前机器人标定。"
-                        " trigger=按住闭合/松开张开, squeeze=保留且不参与机械臂控制, "
+                        " trigger=按住闭合/松开张开, R1Pro 左/右摇杆按住=腰部低速连续正/负旋转（同键盘 5/6）, "
                         "ranger_arm: 左摇杆前后=行驶、左右=转向；"
                         "r1pro: 左摇杆前后/左右=底盘移动、右摇杆左右=底盘自旋, "
                         "左手柄 X/Y=腰部关节1负/正, "
@@ -2821,6 +2874,7 @@ def main() -> None:
     state_api = None
     vr_switch_server = None
     camera_image_captures = {}
+    last_state_api_publish_time = 0.0
     last_camera_image_capture_time = 0.0
     loop_frame_times_ms = deque(maxlen=120)
     simulation_step_times_ms = deque(maxlen=120)
@@ -2858,6 +2912,7 @@ def main() -> None:
                     name: {"position": units[0], "effort": units[1]}
                     for name, units in feedback.get("joint_units", {}).items()
                 },
+                "gripper_force": feedback.get("gripper_force", {}),
             }
         for state in drone_states_by_path.values():
             translation = state.get("translation", (0.0, 0.0, 0.0))
@@ -2915,6 +2970,7 @@ def main() -> None:
             "simulation_step_ms_mean": sum(step_times) / len(step_times) if step_times else 0.0,
             "simulation_step_ms_max": max(step_times) if step_times else 0.0,
             "camera_image_target_fps": args.state_api_image_fps if camera_image_captures else 0.0,
+            "state_feedback_target_fps": args.state_api_fps if state_api is not None else 0.0,
             "openxr_enabled": bool(args.enable_openxr_r1pro_vr and args.xr_openxr),
             "openxr_calibrated": bool(openxr_vr_calibrated),
             "udp_vr_control_age_ms": udp_age_ms,
@@ -2923,8 +2979,13 @@ def main() -> None:
         }
 
     def _publish_state_api() -> None:
+        nonlocal last_state_api_publish_time
         if state_api is None:
             return
+        now = time.time()
+        if last_state_api_publish_time > 0.0 and now - last_state_api_publish_time < 1.0 / max(args.state_api_fps, 0.1):
+            return
+        last_state_api_publish_time = now
         robots = _state_api_robot_snapshot()
         state_api.publish(robots, robot_camera_aliases, _state_api_relative_poses(robots), _state_api_telemetry())
 
@@ -2942,7 +3003,11 @@ def main() -> None:
                 if rgb.ndim != 3 or rgb.shape[2] < 3:
                     continue
                 output = io.BytesIO()
-                capture["image"].fromarray(rgb[:, :, :3].astype(np.uint8), mode="RGB").save(output, format="JPEG", quality=85)
+                capture["image"].fromarray(rgb[:, :, :3].astype(np.uint8)).save(
+                    output,
+                    format="JPEG",
+                    quality=85,
+                )
                 state_api.publish_image(robot_name, alias, output.getvalue())
             except Exception as exc:  # noqa: BLE001
                 carb.log_warn(f"Failed to capture {robot_name}.{alias} HTTP camera image: {exc}")
@@ -2986,6 +3051,14 @@ def main() -> None:
             lines.append(f"Base position xyz (m): {position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}")
         if quat.size >= 4:
             lines.append(f"Base orientation quat wxyz: {quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}")
+        gripper_force = feedback.get("gripper_force", {})
+        lines.append("")
+        lines.append("Gripper simulated force feedback")
+        for side in ("left", "right"):
+            side_force = gripper_force.get(side, {})
+            effort = float(side_force.get("effort", 0.0))
+            unit = side_force.get("unit", "N*m")
+            lines.append(f"  {side}: {effort:.4f} {unit} (measured joint effort)")
         lines.append("")
         lines.append("Non-wheel joints: position / measured effort")
         if not joint_positions:
@@ -3033,12 +3106,27 @@ def main() -> None:
             return None
         return dispatcher.active_controller()
 
+    def _disable_openxr_scene_menu() -> None:
+        """禁用 Y 键默认 XR 菜单并删除已生成到 controllers layer 的面板。"""
+        if not args.xr_openxr or openxr_xr_core is None:
+            return
+        try:
+            openxr_xr_core.unbind_input_event_generator("xr_menu")
+            from omni.kit.xr.core import XRUsdLayerManager  # noqa: WPS433
+
+            layer_manager = XRUsdLayerManager.get_singleton()
+            if layer_manager is not None and layer_manager.has_usd_layer("controllers"):
+                layer_manager.get_usd_layer("controllers").remove_group("menu_tool")
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"Could not disable the in-scene XR settings menu: {exc}")
+
     def _select_openxr_robot(name: str, source: str) -> None:
         """同时切换机器人控制、头部相机，并清除上一机器人的 VR 零位。"""
         nonlocal openxr_vr_calibrated, openxr_vr_last_calibrate_pressed
         _activate_robot(name, source)
         if dispatcher.active_name != name:
             return
+        _disable_openxr_scene_menu()
         _switch_named_camera(name, "head_top")
         openxr_vr_calibrated = False
         openxr_vr_last_calibrate_pressed = False
@@ -3282,6 +3370,7 @@ def main() -> None:
             squeeze=float(left_data[1, 3]),
             button_0=float(left_data[1, 4]),
             button_1=float(left_data[1, 5]),
+            thumbstick_click=float(left_data[1, 6]),
         )
         right_state = VRControllerState(
             position=right_pos,
@@ -3292,6 +3381,7 @@ def main() -> None:
             squeeze=float(right_data[1, 3]),
             button_0=float(right_data[1, 4]),
             button_1=float(right_data[1, 5]),
+            thumbstick_click=float(right_data[1, 6]),
         )
         return left_state, right_state
 
@@ -3621,16 +3711,74 @@ def main() -> None:
             ]
         ).astype(np.float32)
 
+    def _set_openxr_gripper_haptics(controller, left_state, right_state) -> None:
+        """将仿真夹爪关节 effort 映射为 Quest 左右手柄振动强度。"""
+        if not args.openxr_gripper_haptics or openxr_xr_core is None or controller is None:
+            return
+        feedback = controller.robot_feedback_snapshot()
+        force_by_side = feedback.get("gripper_force", {})
+        state_by_side = {"left": left_state, "right": right_state}
+        for side in ("left", "right"):
+            device = openxr_xr_core.get_input_device(f"/user/hand/{side}")
+            if device is None:
+                continue
+            output_name = openxr_haptic_outputs.get(side)
+            if output_name is None:
+                try:
+                    candidates = list(device.get_output_names())
+                    output_name = next(
+                        (
+                            name
+                            for name in candidates
+                            if "haptic" in str(name).lower()
+                            and "thumb" not in str(name).lower()
+                            and "trigger" not in str(name).lower()
+                        ),
+                        None,
+                    )
+                    if output_name is None:
+                        output_name = "/output/haptic"
+                        device.ensure_output(output_name)
+                    openxr_haptic_outputs[side] = output_name
+                except Exception as exc:  # noqa: BLE001
+                    if side not in openxr_haptic_warned:
+                        carb.log_warn(f"Quest {side} haptic output unavailable: {exc}")
+                        openxr_haptic_warned.add(side)
+                    continue
+            effort = abs(float(force_by_side.get(side, {}).get("effort", 0.0)))
+            amplitude = float(np.clip(effort / max(args.openxr_haptic_full_scale_effort, 1e-6), 0.0, 1.0))
+            # 静止时的微小关节保持力不应造成持续振动；夹爪未闭合时也清零。
+            side_state = state_by_side.get(side)
+            if amplitude < 0.03 or side_state is None or float(side_state.trigger) <= 0.35:
+                amplitude = 0.0
+            try:
+                device.set_output_value(output_name, amplitude)
+            except Exception as exc:  # noqa: BLE001
+                if side not in openxr_haptic_warned:
+                    carb.log_warn(f"Quest {side} haptic write failed: {exc}")
+                    openxr_haptic_warned.add(side)
+
     def _apply_openxr_vr_torso(left_state, right_state) -> bool:
         if dispatcher.active_name != "r1pro" or r1pro_controller is None or left_state is None or right_state is None:
             return False
-        torso_axis_1 = float(left_state.button_1 > 0.5) - float(left_state.button_0 > 0.5)
-        torso_axis_2 = float(right_state.button_1 > 0.5) - float(right_state.button_0 > 0.5)
-        if abs(torso_axis_1) < 1e-4 and abs(torso_axis_2) < 1e-4:
+        # Do not drive torso_joint1..3 from Quest face buttons. They are pitch
+        # joints and can shift the upper-body center of mass enough to topple
+        # or visually separate the imported articulated links during motion.
+        torso_axis_1 = 0.0
+        torso_axis_2 = 0.0
+        left_yaw_pressed = bool(left_state.thumbstick_click > 0.5)
+        right_yaw_pressed = bool(right_state.thumbstick_click > 0.5)
+        torso_axis_4 = float(left_yaw_pressed) - float(right_yaw_pressed)
+        if abs(torso_axis_1) < 1e-4 and abs(torso_axis_2) < 1e-4 and abs(torso_axis_4) < 1e-4:
             return False
         torso_delta = np.zeros(4, dtype=np.float32)
         torso_delta[0] = torso_axis_1 * float(args.openxr_vr_torso_speed) * float(args.dt)
         torso_delta[1] = torso_axis_2 * float(args.openxr_vr_torso_speed) * float(args.dt)
+        if abs(torso_axis_4) > 1e-4 and r1pro_controller.torso_target.size >= 4:
+            current_yaw = float(r1pro_controller.torso_target[3])
+            yaw_step = max(0.0, float(args.openxr_vr_torso_yaw_speed)) * float(args.dt) * torso_axis_4
+            yaw_limit = math.radians(max(0.0, float(args.openxr_vr_torso_yaw_limit_deg)))
+            torso_delta[3] = float(np.clip(current_yaw + yaw_step, -yaw_limit, yaw_limit) - current_yaw)
         r1pro_controller._apply_torso_target(torso_delta)
         return True
 
@@ -3933,6 +4081,11 @@ def main() -> None:
             openxr_left_state = None
             openxr_right_state = None
             openxr_vr_active_adapter = None
+            # Head-view selection is independent from Y+B arm calibration.
+            # Keep the Quest3 world anchor on the selected robot camera even
+            # before controllers are visible or the arm zero pose is captured.
+            if active_camera_control.get("robot_name") in ("ranger_arm", "r1pro"):
+                _update_openxr_head_anchor_with_limits()
             active_openxr_controller = _active_openxr_controller()
             if (
                 openxr_vr_bridge is not None
@@ -3946,6 +4099,7 @@ def main() -> None:
                         openxr_left_state.button_1 > 0.5 and openxr_right_state.button_1 > 0.5
                     )
                     if calibrate_pressed and not openxr_vr_last_calibrate_pressed:
+                        _disable_openxr_scene_menu()
                         active_openxr_controller.sync_ik_targets()
                         _capture_openxr_vr_calibration(openxr_left_state, openxr_right_state)
                         _capture_openxr_head_limit_reference()
@@ -3957,7 +4111,6 @@ def main() -> None:
                         )
                     openxr_vr_last_calibrate_pressed = calibrate_pressed
                     if openxr_vr_calibrated:
-                        _update_openxr_head_anchor_with_limits()
                         openxr_vr_base_control = _build_openxr_vr_base_control(openxr_left_state, openxr_right_state)
                         if (
                             dispatcher.active_name == "ranger_arm"
@@ -4265,6 +4418,8 @@ def main() -> None:
             # 在同一帧覆盖双手柄生成的末端目标。
             if openxr_output is not None and openxr_vr_active_adapter is not None:
                 openxr_vr_consumed = bool(openxr_vr_active_adapter.apply(openxr_output)) or openxr_vr_consumed
+            if active_controller is not None and openxr_left_state is not None and openxr_right_state is not None:
+                _set_openxr_gripper_haptics(active_controller, openxr_left_state, openxr_right_state)
             if should_dispatch:
                 if args.log_joint_positions and (base_has_input or arm_has_input):
                     now = time.time()

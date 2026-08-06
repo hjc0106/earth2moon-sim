@@ -29,7 +29,7 @@
 - `r1pro.left_gripper`
 - `r1pro.right_gripper`
 
-相机别名、USD Camera 路径和外部切换方式也通过 [TELEOP_STATE_API.md](/home/zjz/workspace/tiangong/earth2moon-sim/docs/TELEOP_STATE_API.md) 提供。无人机 `cf2x`、`cf2x_01` 均提供 `chase` 视角，因此场景共有四个机器人可通过接口查询和切换视角。
+相机别名、USD Camera 路径和外部切换方式也通过 [TELEOP_STATE_API.md](TELEOP_STATE_API.md) 提供。无人机 `cf2x`、`cf2x_01` 均提供 `chase` 视角，因此场景共有四个机器人可通过接口查询和切换视角。
 - `cf2x.chase`
 - `cf2x_01.chase`
 
@@ -43,6 +43,8 @@
 - `F6`：当前激活轮式机器人的 `head_top`
 - `F3`：切到 `ranger_arm.head_top`，同时选择 Ranger VR 控制
 - `F4`：切到 `r1pro.head_top`，同时选择 R1 Pro VR 控制
+
+`F3` 和 `F4` 的头部相机统一使用机体 `+X` 为前方、`+Z` 为画面上方，并固定向下俯视 15 度。相机不继承模型内嵌摄像头的导入坐标轴，避免出现朝地、后视或画面翻转。R1 Pro 相机跟随 `torso_link4`，因此按 `5/6` 旋转 `torso_joint4` 时会同步转动。
 
 无人机相机直接绑定：
 
@@ -60,7 +62,7 @@
 
 ## 当前实现位置
 
-主逻辑在 [scripts/keyboard_teleop_ranger_arm.py](/home/zjz/workspace/tiangong/earth2moon-sim/scripts/keyboard_teleop_ranger_arm.py:1431)。
+主逻辑在 [`scripts/keyboard_teleop_ranger_arm.py`](../scripts/keyboard_teleop_ranger_arm.py)。
 
 对应构建函数：
 
